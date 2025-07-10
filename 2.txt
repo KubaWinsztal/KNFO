@@ -1,0 +1,118 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize_scalar
+
+def calculate_pd_bounds_section2(freq_df: pd.DataFrame, ratings_order: list, pd_column_name: str, confidence_level: float = 0.95) -> pd.DataFrame:
+    """
+    Calculates upper confidence bounds for PDs for a zero-default portfolio.
+    It now handles a separate PD column and sets PD to 1 for zero frequencies.
+
+    Args:
+        freq_df (pd.DataFrame): DataFrame with frequencies and an external PD estimation column.
+        ratings_order (list): A list of the rating strings, ordered from best to worst.
+        pd_column_name (str): The name of the column containing existing PD estimations.
+        confidence_level (float): The confidence level (gamma) for the upper bound calculation.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing the calculated PD bounds and the original PD column.
+    """
+    # Create a copy and separate the PD estimation column
+    df_copy = freq_df.copy()
+    model_pd_column = df_copy.pop(pd_column_name)
+
+    # Sort by rating order to prepare for cumulative sum
+    df_sorted = df_copy.loc[ratings_order]
+
+    # Calculate the cumulative sum from worst to best grade
+    cumulative_freq = df_sorted.iloc[::-1].cumsum().iloc[::-1]
+
+    # Calculate PD bounds using the formula: p_hat = 1 - (1 - gamma)^(1/N)
+    gamma = confidence_level
+    pd_bounds_df = 1 - (1 - gamma)**(1 / cumulative_freq)
+
+    # Per user request, if cumulative frequency is 0, the PD bound is 1 (100%)
+    pd_bounds_df.replace([np.inf, -np.inf], 1, inplace=True)
+    
+    # Add the original PD estimation column back to the results
+    pd_bounds_df[pd_column_name] = model_pd_column
+    
+    # Return the dataframe with the original index order
+    return pd_bounds_df.loc[freq_df.index]
+
+def calibrate_gamma(freq_df: pd.DataFrame, ratings_order: list, calibration_ratings: list, pd_column_name: str) -> tuple:
+    """
+    Finds the optimal gamma by minimizing the RMSE between calculated PDs and
+    model PDs for a specified subset of ratings.
+
+    Args:
+        freq_df (pd.DataFrame): The input DataFrame with frequencies and model PDs.
+        ratings_order (list): The ordered list of all ratings.
+        calibration_ratings (list): The subset of ratings to use for calibration.
+        pd_column_name (str): The name of the model PDs column.
+
+    Returns:
+        tuple: A tuple containing the optimal gamma and the minimum RMSE.
+    """
+    
+    target_pds = freq_df.loc[calibration_ratings, pd_column_name].values.flatten()
+    
+    # Objective function to be minimized: returns RMSE for a given gamma
+    def objective_function_rmse(gamma):
+        # Calculate PDs for the current gamma
+        calculated_pds_df = calculate_pd_bounds_section2(freq_df, ratings_order, pd_column_name, confidence_level=gamma)
+        
+        # Get the calculated PDs for the calibration ratings
+        calculated_pds = calculated_pds_df.loc[calibration_ratings, freq_df.columns != pd_column_name].values.flatten()
+        
+        # Calculate RMSE
+        rmse = np.sqrt(np.mean((calculated_pds - target_pds)**2))
+        return rmse
+
+    # Use a bounded scalar optimizer to find the gamma that minimizes the RMSE
+    # Bounds are set to (0, 1) as gamma is a probability.
+    result = minimize_scalar(objective_function_rmse, bounds=(0.0001, 0.9999), method='bounded')
+    
+    optimal_gamma = result.x
+    min_rmse = result.fun
+    
+    return optimal_gamma, min_rmse
+
+# --- Example Usage ---
+
+# 1. Define ratings and data
+ratings_order = ['1', '2+', '2', '2-', '3+', '3', '3-', '4+', '4', '4-', '5+', '5', '5-', '6+', '6', '6-', '7+', '7', '7-']
+data = {
+    '2024-Q1': [10, 50, 80, 120, 150, 200, 180, 250, 300, 280, 220, 190, 160, 130, 100, 90, 60, 40, 20],
+    '2024-Q2': [12, 55, 82, 125, 155, 205, 185, 255, 305, 285, 225, 195, 165, 135, 105, 95, 65, 42, 22],
+    # Adding the required PD estimations column from another model
+    'Model_PDs': [0.0001, 0.0003, 0.0005, 0.0008, 0.0012, 0.0020, 0.0035, 0.0060, 0.010, 0.018, 0.025, 0.035, 0.050, 0.075, 0.10, 0.15, 0.22, 0.30, 0.50]
+}
+frequencies_df = pd.DataFrame(data, index=ratings_order)
+
+# 2. Define the ratings to use for calibration ('7-' up to '4-')
+calibration_ratings = ratings_order[ratings_order.index('4-'):]
+
+print("--- Calibrating to find optimal Gamma ---")
+optimal_gamma, min_rmse = calibrate_gamma(
+    freq_df=frequencies_df,
+    ratings_order=ratings_order,
+    calibration_ratings=calibration_ratings,
+    pd_column_name='Model_PDs'
+)
+
+print(f"Optimal Gamma found: {optimal_gamma:.6f}")
+print(f"Minimum RMSE achieved: {min_rmse:.6f}")
+print("\n" + "="*50 + "\n")
+
+# 3. Calculate the final PD bounds using the optimal gamma
+print("--- Final PD Bounds using Optimal Gamma ---")
+final_pds = calculate_pd_bounds_section2(
+    freq_df=frequencies_df,
+    ratings_order=ratings_order,
+    pd_column_name='Model_PDs',
+    confidence_level=optimal_gamma
+)
+
+# Display the results, formatting as percentages
+print(final_pds.style.format('{:.4%}'))
+
