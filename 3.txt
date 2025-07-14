@@ -1,0 +1,79 @@
+import pandas as pd
+from scipy.stats import binom, beta
+
+def solve_for_gamma(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Oblicza poziom ufności gamma na dwa sposoby na podstawie danych wejściowych.
+
+    Argumenty:
+        df (pd.DataFrame): Ramka danych zawierająca kolumny z częstotliwościami
+                           dłużników w poszczególnych kwartałach, kolumnę 'defaults'
+                           z liczbą niewykonanych zobowiązań oraz kolumnę 'PD' z
+                           prawdopodobieństwem niewykonania zobowiązania.
+                           Indeks ramki danych powinien zawierać ratingi.
+
+    Zwraca:
+        pd.DataFrame: Oryginalna ramka danych z dodanymi kolumnami dla
+                      obliczonej gammy przy użyciu rozkładu dwumianowego i beta.
+    """
+    # Oblicz całkowitą liczbę dłużników 'n' dla każdego ratingu
+    freq_columns = [col for col in df.columns if col.startswith('Q')]
+    df['n'] = df[freq_columns].sum(axis=1)
+
+    # Przygotuj listy do przechowywania wyników
+    gamma_binom_list = []
+    gamma_beta_list = []
+
+    # Iteruj po każdym ratingu (wierszu) w ramce danych
+    for rating in df.index:
+        n = int(df.loc[rating, 'n'])
+        k = int(df.loc[rating, 'defaults'])
+        p = df.loc[rating, 'PD']
+
+        # 1. Rozwiązanie przy użyciu rozkładu dwumianowego
+        # gamma = 1 - P(X <= k), gdzie X ~ Binomial(n, p)
+        # scipy.stats.binom.cdf(k, n, p) oblicza P(X <= k)
+        cdf_binomial = binom.cdf(k, n, p)
+        gamma_binom = 1 - cdf_binomial
+        gamma_binom_list.append(gamma_binom)
+
+        # 2. Rozwiązanie przy użyciu rozkładu beta
+        # Zgodnie z Załącznikiem A, P(X <= k) dla rozkładu dwumianowego jest równe
+        # 1 - P(Y <= p), gdzie Y ~ Beta(k+1, n-k).
+        # Dlatego gamma = P(Y <= p).
+        # scipy.stats.beta.cdf(p, a, b) oblicza P(Y <= p)
+        alpha = k + 1
+        beta_param = n - k
+        gamma_beta = beta.cdf(p, alpha, beta_param)
+        gamma_beta_list.append(gamma_beta)
+
+    # Dodaj wyniki do ramki danych
+    df['gamma_binomial'] = gamma_binom_list
+    df['gamma_beta'] = gamma_beta_list
+
+    return df
+
+# --- Przykład użycia ---
+
+# Utwórz przykładową ramkę danych na podstawie przykładu z dokumentu (Sekcja 3)
+# Częstotliwości (n_A=100, n_B=400, n_C=300) rozłożone na 4 kwartały
+# Liczba niewykonanych zobowiązań: A=0, B=2, C=1
+# Znane wartości PD do przetestowania
+data = {
+    'Q1': [25, 100, 75],
+    'Q2': [25, 100, 75],
+    'Q3': [25, 100, 75],
+    'Q4': [25, 100, 75],
+    'defaults': [0, 2, 1],
+    'PD': [0.0029, 0.0033, 0.0076] # Przykładowe wartości p z Tabel 1, 2, 3 dla gamma=90%
+}
+ratings = ['A', 'B', 'C']
+input_df = pd.DataFrame(data, index=ratings)
+
+# Wywołaj funkcję w celu rozwiązania dla gammy
+results_df = solve_for_gamma(input_df.copy())
+
+# Wyświetl wyniki
+print("Wyniki obliczeń dla Gamma (γ):")
+print(results_df)
+
