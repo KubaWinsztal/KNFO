@@ -1,0 +1,439 @@
+import numpy as np
+import pandas as pd
+from typing import Dict, Tuple, Union, Sequence
+from numpy.polynomial.hermite import hermgauss
+from scipy.stats import norm
+from scipy.special import gammaln, logsumexp, betainc
+from scipy.optimize import minimize_scalar
+
+# ============================================================
+# Core math utilities
+# ============================================================
+
+def _vasicek_q(p: float, rho: float, y: np.ndarray) -> np.ndarray:
+    """
+    Conditional PD in the Vasicek one-factor probit model:
+        q(y; p, rho) = Phi( (Phi^{-1}(p) - sqrt(rho)*y) / sqrt(1-rho) )
+
+    Parameters
+    ----------
+    p : float
+        Unconditional PD for a rating bucket (0 < p < 1).
+    rho : float
+        Asset correlation (0 < rho < 1).
+    y : np.ndarray
+        Nodes of the systematic factor Y ~ N(0,1).
+
+    Returns
+    -------
+    np.ndarray
+        Conditional PD values q(y) evaluated at each node in `y`.
+    """
+    p = float(np.clip(p, 1e-12, 1 - 1e-12))
+    rho = float(np.clip(rho, 1e-12, 1 - 1e-12))
+    num = norm.ppf(p) - np.sqrt(rho) * y
+    den = np.sqrt(1.0 - rho)
+    return norm.cdf(num / den)  # G(p, rho, y) in Pluto & Tasche (2005), eq. (4.3b). 
+
+
+def _log_binom_pmf(k: np.ndarray, n: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """
+    Stable log Binomial PMF:
+        log C(n,k) + k log q + (n-k) log(1-q)
+
+    Parameters
+    ----------
+    k : np.ndarray
+        Defaults count(s), integer.
+    n : np.ndarray
+        Exposure count(s), integer, n >= k.
+    q : np.ndarray
+        Success probability(ies), same broadcastable shape.
+
+    Returns
+    -------
+    np.ndarray
+        Log PMF values.
+    """
+    q = np.clip(q, 1e-16, 1 - 1e-16)
+    return (gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
+            + k * np.log(q) + (n - k) * np.log(1 - q))
+
+
+def _gh_nodes_weights(n_nodes: int = 60) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Gauss–Hermite nodes/weights adapted to integrals of the form:
+        ∫ phi(y) f(y) dy,  where phi is N(0,1) density.
+
+    Transform standard Hermite (for ∫ e^{-x^2} f(x) dx):
+        y = sqrt(2)*x,   w' = w / sqrt(pi)
+
+    Parameters
+    ----------
+    n_nodes : int
+        Number of quadrature nodes.
+
+    Returns
+    -------
+    ys : np.ndarray
+        Transformed nodes for standard normal, shape (n_nodes,).
+    log_ws : np.ndarray
+        Log-weights, shape (n_nodes,). Using logs improves numerical stability.
+    """
+    x, w = hermgauss(n_nodes)
+    ys = np.sqrt(2.0) * x
+    log_ws = np.log(w) - 0.5 * np.log(np.pi)
+    return ys, log_ws
+
+
+# ============================================================
+# Likelihood for fixed PD vector — MLE for rho
+# ============================================================
+
+def _negloglik_rho(
+    rho: float,
+    K: np.ndarray,
+    N: np.ndarray,
+    p_vec: np.ndarray,
+    ys: np.ndarray,
+    log_ws: np.ndarray
+) -> float:
+    """
+    Negative log-likelihood for a fixed PD vector p_vec and candidate rho.
+
+    Model (single systematic factor Y):
+        L_t(rho) = ∫ phi(y) * Π_g Binom(k_{t,g} | n_{t,g}, q(y; p_g, rho)) dy
+        log L(rho) = Σ_t log L_t(rho)
+
+    Parameters
+    ----------
+    rho : float
+        Candidate asset correlation.
+    K : np.ndarray, shape (T, G)
+        Defaults counts per period t and rating g.
+    N : np.ndarray, shape (T, G)
+        Exposure counts per period t and rating g.
+    p_vec : np.ndarray, shape (G,)
+        Fixed PDs per rating bucket (best -> worst).
+    ys : np.ndarray
+        Gauss–Hermite nodes for Y.
+    log_ws : np.ndarray
+        Log-weights corresponding to `ys`.
+
+    Returns
+    -------
+    float
+        Negative log-likelihood value at `rho`.
+    """
+    T, G = K.shape
+    n_nodes = ys.size
+    nll = 0.0
+
+    rho = float(np.clip(rho, 1e-12, 1 - 1e-12))
+
+    for t in range(T):
+        if N[t].sum() == 0:
+            continue
+
+        log_vals = np.empty(n_nodes)
+        for i in range(n_nodes):
+            y = ys[i]
+            s = 0.0
+            for g in range(G):
+                n_tg = N[t, g]
+                if n_tg == 0:
+                    continue
+                k_tg = K[t, g]
+                q = _vasicek_q(p_vec[g], rho, y)
+                s += _log_binom_pmf(k_tg, n_tg, q)
+            log_vals[i] = log_ws[i] + s
+
+        log_int = logsumexp(log_vals)  # log ∫ phi(y) Π_g Binom(...) dy
+        nll -= log_int
+
+    return float(nll)  # Likelihood structure per (4.3a) and (6.7)–(6.8b). 
+
+
+def fit_rho_mle_fixed_p_list(
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    p_list: Sequence[float],
+    bounds: Tuple[float, float] = (1e-6, 0.30),
+    n_nodes: int = 60,
+    method: str = "bounded",
+    check_monotonic: bool = True
+) -> Dict[str, Union[float, str]]:
+    """
+    Estimate the common asset correlation rho by MLE in the Vasicek one-factor model,
+    given a **fixed** vector of PDs per rating (best -> worst).
+
+    Parameters
+    ----------
+    df_exposures : pd.DataFrame, shape (G, T)
+        Rows = rating buckets (ordered best -> worst), columns = time periods.
+        Values are exposures n_{g,t}.
+    df_defaults : pd.DataFrame, shape (G, T)
+        Same shape as df_exposures; values are defaults k_{g,t}.
+    p_list : Sequence[float], length G
+        PDs per rating (best -> worst). Should be non-decreasing. If `check_monotonic=True`,
+        a violation raises ValueError.
+    bounds : (float, float)
+        Bounds for rho in the scalar optimizer (typical 1e-6 .. 0.30 for corporate portfolios).
+    n_nodes : int
+        Gauss–Hermite nodes used for ∫ phi(y) f(y) dy (50–80 is a good range).
+    method : str
+        `scipy.optimize.minimize_scalar` method. Use 'bounded' with given bounds.
+    check_monotonic : bool
+        If True, checks that p_list is non-decreasing.
+
+    Returns
+    -------
+    dict
+        {
+          'rho': float,           # MLE estimate of rho (with fixed p_list)
+          'negloglik': float,     # minimized negative log-likelihood
+          'status': str           # 'success' / 'fail' from the optimizer
+        }
+
+    Notes
+    -----
+    - The integrand and the multi-period, multi-rating construction follow Pluto & Tasche (2005):
+      q(y; p, rho) in eq. (4.3b), and the integrated binomial likelihood in (6.7)–(6.8b). 
+    - This step estimates only rho. Conservative PDs for a target confidence level are obtained
+      afterwards by solving an inequality in p with rho fixed (see `compute_p_gamma_beta`).
+    """
+    if not df_exposures.index.equals(df_defaults.index) or not df_exposures.columns.equals(df_defaults.columns):
+        raise ValueError("df_exposures and df_defaults must have identical index and columns.")
+
+    G = df_exposures.shape[0]
+    p_arr = np.asarray(p_list, dtype=float).reshape(-1)
+    if p_arr.size != G:
+        raise ValueError(f"Length of p_list ({p_arr.size}) must equal number of ratings (rows={G}).")
+
+    if check_monotonic and np.any(np.diff(p_arr) < -1e-15):
+        raise ValueError("p_list must be ordered best -> worst (non-decreasing PDs).")
+
+    # Convert to arrays shaped (T, G) for period-wise loops.
+    N = df_exposures.to_numpy(dtype=float).T
+    K = df_defaults.to_numpy(dtype=float).T
+
+    if (K > N).any():
+        raise ValueError("Defaults cannot exceed exposures.")
+    if (K < 0).any() or (N < 0).any():
+        raise ValueError("Negative counts detected.")
+
+    ys, log_ws = _gh_nodes_weights(n_nodes)
+
+    def obj(rho: float) -> float:
+        return _negloglik_rho(rho, K, N, p_arr, ys, log_ws)
+
+    opt = minimize_scalar(obj, bounds=bounds, method=method)
+    return {
+        "rho": float(opt.x),
+        "negloglik": float(opt.fun),
+        "status": "success" if opt.success else "fail"
+    }
+
+
+# ============================================================
+# Confidence upper bound for PD (Tasche) with fixed rho
+# ============================================================
+
+def _integrated_binom_cdf_leq_k_beta(
+    p: float,
+    rho: float,
+    k: int,
+    n: int,
+    nodes: int = 60
+) -> float:
+    """
+    Compute g(p, rho) = ∫ phi(y) * P[X <= k | Bin(n, q(y;p,rho))] dy
+    using the Beta-CDF identity for numerical stability:
+        P[X <= k] = 1 - I_{q}(k+1, n-k),  where I is the regularized incomplete beta.
+
+    Parameters
+    ----------
+    p : float
+        Unconditional PD.
+    rho : float
+        Asset correlation.
+    k : int
+        Observed defaults.
+    n : int
+        Exposures.
+    nodes : int
+        Gauss–Hermite nodes.
+
+    Returns
+    -------
+    float
+        Value of g(p, rho).
+    """
+    if n < 0 or k < 0 or k > n:
+        raise ValueError("Require 0 <= k <= n and n >= 0.")
+
+    x, w = hermgauss(nodes)
+    ys = np.sqrt(2.0) * x
+    ws = w / np.sqrt(np.pi)
+
+    a = k + 1
+    b = n - k
+
+    q = _vasicek_q(p, rho, ys)
+    # I_q(a,b) is the Beta CDF at q; P[X<=k] = 1 - I_q(k+1, n-k)
+    vals = 1.0 - betainc(a, b, q)
+    return float(np.dot(ws, vals))  # (A.1) identity; cf. Appendix A. 
+
+
+def compute_p_gamma_beta(
+    k: int,
+    n: int,
+    rho: float,
+    gamma: float = 0.95,
+    p_lo: float = 1e-8,
+    p_hi: float = 0.50,
+    tol: float = 1e-8,
+    nodes: int = 60,
+    max_iter: int = 200
+) -> float:
+    """
+    Find the **largest** p such that:
+        ∫ phi(y) * P[X <= k | Bin(n, q(y;p,rho))] dy >= 1 - gamma
+
+    This is the conservative PD upper bound in the Vasicek model (Tasche approach),
+    using the Beta-CDF trick for the binomial CDF.
+
+    Parameters
+    ----------
+    k : int
+        Observed defaults for a rating (pooled across periods if desired).
+    n : int
+        Total exposures for the rating.
+    rho : float
+        Asset correlation (e.g., MLE estimate).
+    gamma : float
+        Confidence level (e.g., 0.95 or 0.99). The inequality uses 1 - gamma on RHS.
+    p_lo : float
+        Lower search bound for p.
+    p_hi : float
+        Upper search bound for p (typically <= 0.5 for credit PDs).
+    tol : float
+        Bisection tolerance on p.
+    nodes : int
+        Gauss–Hermite nodes for the integral over Y.
+    max_iter : int
+        Maximum bisection iterations.
+
+    Returns
+    -------
+    float
+        Conservative PD upper bound p_hat_gamma.
+
+    Notes
+    -----
+    Monotonicity in p guarantees uniqueness of the solution for fixed rho,
+    see Appendix A (A.5a)-(A.5c). 
+    """
+    target = 1.0 - float(gamma)
+    lo, hi = float(p_lo), float(p_hi)
+
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        val = _integrated_binom_cdf_leq_k_beta(mid, rho, k, n, nodes=nodes)
+        if val >= target:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return lo
+
+
+def p_gamma_per_rating(
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    rho: float,
+    gamma: float = 0.95,
+    nodes: int = 60,
+    pool: str = "sum"
+) -> pd.Series:
+    """
+    Compute conservative PD upper bounds p_hat_gamma for each rating bucket
+    given a fixed rho, using the Tasche inequality with the Beta-CDF identity.
+
+    Parameters
+    ----------
+    df_exposures : pd.DataFrame, shape (G, T)
+        Exposures per rating (rows) and period (columns).
+    df_defaults : pd.DataFrame, shape (G, T)
+        Defaults per rating and period.
+    rho : float
+        Asset correlation (e.g., MLE estimate).
+    gamma : float
+        Confidence level, e.g., 0.95 or 0.99.
+    nodes : int
+        Gauss–Hermite nodes for the integral.
+    pool : {'sum', 'per-period-product'}
+        - 'sum'  : pool counts across time: k_g = Σ_t k_{g,t}, n_g = Σ_t n_{g,t}, then solve once.
+                   This mirrors the single-period inequality and is widely used in practice.
+        - 'per-period-product':
+                   solve for p that maximizes the product over periods of the inequalities;
+                   practically, compute p s.t. Π_t g_t(p, rho) >= (1-gamma)^T, where
+                   g_t is the single-period integral. This assumes independent Y_t across t.
+
+    Returns
+    -------
+    pd.Series
+        Conservative PDs per rating (indexed as df_exposures.index).
+
+    Notes
+    -----
+    - The 'sum' option corresponds to using pooled counts and the one-period inequality,
+      which is simpler and common. The full multi-period dependence with correlated
+      factors across time is described in Section 6; implementing that exactly requires
+      a T-dimensional normal integral. 
+    """
+    if not df_exposures.index.equals(df_defaults.index) or not df_exposures.columns.equals(df_defaults.columns):
+        raise ValueError("df_exposures and df_defaults must have identical index and columns.")
+
+    ratings = df_exposures.index
+    T = df_exposures.shape[1]
+
+    out = []
+    if pool == "sum":
+        cum_k = df_defaults.sum(axis=1).astype(int)
+        cum_n = df_exposures.sum(axis=1).astype(int)
+        for g in ratings:
+            k = int(cum_k.loc[g])
+            n = int(cum_n.loc[g])
+            p_hat = compute_p_gamma_beta(k, n, rho, gamma=gamma, nodes=nodes)
+            out.append(p_hat)
+    elif pool == "per-period-product":
+        # Find p such that Π_t g_t(p, rho) >= (1-gamma)^T  <=>  Σ_t log g_t >= T*log(1-gamma)
+        target_log = T * np.log(1.0 - float(gamma))
+
+        def product_condition(p: float, ks: np.ndarray, ns: np.ndarray) -> float:
+            vals = []
+            for kt, nt in zip(ks, ns):
+                vals.append(_integrated_binom_cdf_leq_k_beta(p, rho, int(kt), int(nt), nodes=nodes))
+            return float(np.sum(np.log(np.maximum(vals, 1e-300))))  # log product
+
+        for g in ratings:
+            ks = df_defaults.loc[g].to_numpy(dtype=int)
+            ns = df_exposures.loc[g].to_numpy(dtype=int)
+            # Bisection on p in [1e-8, 0.5]
+            lo, hi = 1e-8, 0.5
+            for _ in range(200):
+                mid = 0.5*(lo + hi)
+                s = product_condition(mid, ks, ns)
+                if s >= target_log:
+                    lo = mid
+                else:
+                    hi = mid
+                if hi - lo < 1e-8:
+                    break
+            out.append(lo)
+    else:
+        raise ValueError("pool must be 'sum' or 'per-period-product'.")
+
+    return pd.Series(out, index=ratings, name=f"p_hat_gamma_{gamma}")
