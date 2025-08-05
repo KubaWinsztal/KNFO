@@ -1,0 +1,119 @@
+import numpy as np
+import pandas as pd
+from typing import Literal, Optional
+from scipy.stats import norm
+from scipy.special import betainc
+from numpy.polynomial.hermite import hermgauss
+
+
+def _portfolio_upper_bound(
+    n_total: int,
+    k_total: int,
+    rho: float,
+    gamma: float,
+    nodes: int = 60,
+) -> float:
+    """Górna granica PD portfela (sekcja 2–4) – identyczna jak dla najlepszej klasy."""
+    # pomoc: g(p) = P(X ≤ k) przy założeniu „wszyscy z tą samą PD = p”
+    a, b = k_total + 1, n_total - k_total
+    x, w = hermgauss(nodes)
+    ys = np.sqrt(2) * x
+    ws = w / np.sqrt(np.pi)
+
+    lo, hi = 1e-8, 0.5
+    target = 1.0 - gamma
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        z = norm.ppf(mid)
+        q = norm.cdf((z - np.sqrt(rho) * ys) / np.sqrt(1 - rho))
+        g_val = np.dot(ws, 1.0 - betainc(a, b, q))
+        if g_val >= target:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-8:
+            break
+    return lo
+
+
+def scale_pd_df(
+    pd_df: pd.DataFrame,
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    *,
+    method: Literal["observed", "upper_bound"] = "upper_bound",
+    gamma: float = 0.75,
+    rho: Optional[float] = None,
+    nodes: int = 60,
+    port_dr_ub: Optional[float] = None,
+) -> tuple[pd.DataFrame, float]:
+    """
+    Skaluje surowe górne granice PD zapisane w pd_df.
+
+    Parameters
+    ----------
+    pd_df : DataFrame (G × T0)
+        Surowe PD (górne granice) - wiersze: rating, kolumny: start quarter.
+    df_exposures, df_defaults : DataFrame
+        Surowe n_{t,g} i k_{t,g} (te same indeksy/kolumny co pd_df).
+    method : "observed" | "upper_bound"
+        Do czego skalujemy:
+        - "observed"     -> do rzeczywistej Default Rate portfela.
+        - "upper_bound"  -> do górnej granicy DR portfela (sekcja 5).
+    gamma : float
+        Poziom ufności γ, tylko dla "upper_bound".
+    rho : float | None
+        Oszacowana korelacja; wymagana jeśli method="upper_bound"
+        i port_dr_ub niepodany.
+    nodes : int
+        Liczba węzłów GH przy liczeniu górnej granicy.
+    port_dr_ub : float | None
+        Jeśli masz już wyliczoną portfelową górną granicę DR, podaj ją tutaj
+        – funkcja pominie integrację (nodes nieużyty).
+
+    Returns
+    -------
+    scaled_pd_df : DataFrame
+        Przeskalowane PD (taki sam układ jak pd_df).
+    K : float
+        Użyty współczynnik skalujący.
+    """
+    # ---- walidacja struktur -------------------------------------------------
+    if not (pd_df.index.equals(df_exposures.index) and
+            pd_df.columns.equals(df_exposures.columns) and
+            pd_df.index.equals(df_defaults.index) and
+            pd_df.columns.equals(df_defaults.columns)):
+        raise ValueError("Wszystkie trzy DataFrame'y muszą mieć identyczny układ.")
+
+    # ---- 1. średnia ważona surowych PD --------------------------------------
+    n_totals_per_rating = df_exposures.sum(axis=1).astype(float)  # suma po kolumnach
+    mean_upper = float((pd_df * n_totals_per_rating).to_numpy().sum() /
+                       n_totals_per_rating.sum())
+    if mean_upper == 0:
+        raise ValueError("Średnia surowych PD wynosi 0 – nie można skalować.")
+
+    # ---- 2. docelowa centralna tendencja portfela ---------------------------
+    k_total = int(df_defaults.to_numpy().sum())
+    n_total = int(df_exposures.to_numpy().sum())
+
+    if method == "observed":
+        central_target = k_total / n_total if n_total else 0.0
+
+    elif method == "upper_bound":
+        if port_dr_ub is not None:
+            central_target = port_dr_ub
+        else:
+            if rho is None:
+                raise ValueError("Dla method='upper_bound' podaj rho albo port_dr_ub.")
+            central_target = _portfolio_upper_bound(
+                n_total, k_total, rho, gamma, nodes
+            )
+    else:
+        raise ValueError("method must be 'observed' or 'upper_bound'.")
+
+    # ---- 3. współczynnik skalujący ------------------------------------------
+    K = central_target / mean_upper
+
+    # ---- 4. skalowanie i zwrot ---------------------------------------------
+    scaled_pd_df = pd_df * K
+    return scaled_pd_df, K
