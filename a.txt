@@ -1,0 +1,140 @@
+import numpy as np
+import pandas as pd
+from typing import Literal, Optional
+from scipy.stats import norm
+from scipy.special import betainc
+from numpy.polynomial.hermite import hermgauss
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  1.  pomocnicze — wyliczenie górnej granicy DR portfela
+# ────────────────────────────────────────────────────────────────────────────────
+def _port_dr_upper_bound(n_tot: int, k_tot: int,
+                         rho: float, gamma: float, nodes: int = 60) -> float:
+    """Most-prudent upper bound PD for the whole portfolio (sekcje 2-4)."""
+    if k_tot > n_tot:
+        raise ValueError("k_tot > n_tot")
+    a, b = k_tot + 1, n_tot - k_tot
+    x, w = hermgauss(nodes)
+    ys = np.sqrt(2) * x
+    ws = w / np.sqrt(np.pi)
+
+    lo, hi = 1e-8, 0.5
+    target = 1.0 - gamma
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        z = norm.ppf(mid)
+        q = norm.cdf((z - np.sqrt(rho) * ys) / np.sqrt(1 - rho))
+        g_val = np.dot(ws, 1.0 - betainc(a, b, q))
+        if g_val >= target:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-8:
+            break
+    return lo
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  2.  skalowanie jednej tabelki (sekcja 5)  —  wersja skrócona
+# ────────────────────────────────────────────────────────────────────────────────
+def _scale_one_pd_table(
+    pd_df: pd.DataFrame,
+    df_exp: pd.DataFrame,
+    df_def: pd.DataFrame,
+    *,
+    method: Literal["observed", "upper_bound"] = "upper_bound",
+    gamma: float = 0.75,
+    rho: Optional[float] = None,
+    nodes: int = 60,
+    port_dr_ub: Optional[float] = None
+) -> tuple[pd.DataFrame, float]:
+
+    # ---- walidacja układu -----------------------------------
+    if not (pd_df.index.equals(df_exp.index) and pd_df.columns.equals(df_exp.columns) and
+            pd_df.index.equals(df_def.index) and pd_df.columns.equals(df_def.columns)):
+        raise ValueError("pd_df / exposures / defaults muszą mieć identyczny układ.")
+
+    # ---- średnia ważona surowych PD -------------------------
+    w_per_rating = df_exp.sum(axis=1).astype(float)
+    mean_upper = float((pd_df * w_per_rating).to_numpy().sum() / w_per_rating.sum())
+    if mean_upper == 0:
+        raise ValueError("Mean upper PD == 0")
+
+    k_tot = int(df_def.to_numpy().sum())
+    n_tot = int(df_exp.to_numpy().sum())
+
+    # ---- central target ------------------------------------
+    if method == "observed":
+        central = k_tot / n_tot if n_tot else 0.0
+    elif method == "upper_bound":
+        if port_dr_ub is not None:
+            central = port_dr_ub
+        else:
+            if rho is None:
+                raise ValueError("rho required for upper_bound when port_dr_ub not given")
+            central = _port_dr_upper_bound(n_tot, k_tot, rho, gamma, nodes)
+    else:
+        raise ValueError("unknown method")
+
+    K = central / mean_upper
+    return pd_df * K, K
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  3.  wrapper z parametrem  scope = "global" / "per_period"
+# ────────────────────────────────────────────────────────────────────────────────
+def scale_pd(
+    pd_df: pd.DataFrame,
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    *,
+    scope: Literal["global", "per_period"] = "global",
+    method: Literal["observed", "upper_bound"] = "upper_bound",
+    gamma: float = 0.75,
+    rho: Optional[float] = None,
+    nodes: int = 60,
+    # pozwala podać gotowe upper boundy per okres lub globalnie
+    port_dr_ub: Optional[float | dict[str, float]] = None,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """
+    Skaluje górne granice PD (sekcja 5) na dwa sposoby:
+    - scope="global"  →  jedno skalowanie dla całego okresu T,
+    - scope="per_period" → osobne skalowanie dla każdej kolumny.
+
+    Zwraca:
+        scaled_df  – PD po skalowaniu (ten sam układ co wejście),
+        K_dict     – słownik współczynników K (klucz = kolumna lub "GLOBAL")
+    """
+    if scope == "global":
+        scaled, K = _scale_one_pd_table(
+            pd_df, df_exposures, df_defaults,
+            method=method, gamma=gamma, rho=rho,
+            nodes=nodes,
+            port_dr_ub=port_dr_ub if isinstance(port_dr_ub, float) else None
+        )
+        return scaled, {"GLOBAL": K}
+
+    elif scope == "per_period":
+        Ks: dict[str, float] = {}
+        out = pd.DataFrame(index=pd_df.index, columns=pd_df.columns, dtype=float)
+
+        for col in pd_df.columns:
+            scaled_col, K = _scale_one_pd_table(
+                pd_df[[col]],
+                df_exposures[[col]],
+                df_defaults[[col]],
+                method=method,
+                gamma=gamma,
+                rho=rho,
+                nodes=nodes,
+                port_dr_ub=(
+                    port_dr_ub[col] if isinstance(port_dr_ub, dict) and col in port_dr_ub else None
+                )
+            )
+            out[col] = scaled_col[col]
+            Ks[str(col)] = K
+        return out, Ks
+
+    else:
+        raise ValueError("scope must be 'global' or 'per_period'")
