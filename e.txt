@@ -1,0 +1,94 @@
+def _scale_one_pd_table(
+    pd_df, df_exp, df_def,
+    *, method: Literal["observed", "upper_bound"],
+    gamma: float, rho: Optional[float], nodes: int,
+    ub_mode: Literal["global", "local"] = "global",
+    port_dr_ub: Optional[float] = None
+):
+    # — walidacja układu
+    if not (pd_df.index.equals(df_exp.index) and pd_df.columns.equals(df_exp.columns)
+            and pd_df.index.equals(df_def.index) and pd_df.columns.equals(df_def.columns)):
+        raise ValueError("Różny układ indeksów/kolumn.")
+
+    # — średnia ważona surowych PD
+    w = df_exp.sum(axis=1).astype(float)
+    mean_up = float((pd_df * w).to_numpy().sum() / w.sum())
+    if mean_up == 0:
+        raise ValueError("Średnia surowych PD == 0.")
+
+    k_tot, n_tot = int(df_def.to_numpy().sum()), int(df_exp.to_numpy().sum())
+
+    # — central target
+    if method == "observed":
+        central = k_tot / n_tot if n_tot else 0.0
+
+    else:  # method == "upper_bound"
+        if ub_mode == "local":                          # UB = PD najlepszej klasy
+            central = float(pd_df.iloc[0, 0])
+        else:                                          # ub_mode == "global"
+            if port_dr_ub is None:                     # liczymy integralnie
+                if rho is None:
+                    raise ValueError("rho wymagane do globalnej UB.")
+                central = _port_dr_upper_bound(n_tot, k_tot, rho, gamma, nodes)
+            else:
+                central = port_dr_ub                   # z góry podana
+
+    K = central / mean_up
+    return pd_df * K, K
+
+
+def scale_pd(
+    pd_df: pd.DataFrame,
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    *,
+    scope : Literal["global", "per_period"]           = "global",
+    method: Literal["observed", "upper_bound"]        = "upper_bound",
+    ub_mode: Literal["global", "local"]               = "global",   # niezależna 3-cia dźwignia
+    gamma : float = 0.75,
+    rho   : Optional[float] = None,
+    nodes : int = 60
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    # — spójność parametrów
+    if method == "upper_bound" and ub_mode == "local" and scope == "global":
+        raise ValueError("ub_mode='local' ma sens tylko przy scope='per_period'.")
+
+    # — tryb GLOBAL (jedno K)
+    if scope == "global":
+        scaled, K = _scale_one_pd_table(
+            pd_df, df_exposures, df_defaults,
+            method   = method,
+            gamma    = gamma,
+            rho      = rho,
+            nodes    = nodes,
+            ub_mode  = ub_mode      # 'global' lub (ew.) 'local' gdy ktoś wymusi
+        )
+        return scaled, {"GLOBAL": K}
+
+    # — tryb PER-PERIOD (osobne K)
+    out  = pd.DataFrame(index=pd_df.index, columns=pd_df.columns, dtype=float)
+    Ks   = {}
+
+    # jeśli używamy wspólnej UB dla wszystkich kolumn (ub_mode='global')
+    if method == "upper_bound" and ub_mode == "global":
+        k_port, n_port = int(df_defaults.to_numpy().sum()), int(df_exposures.to_numpy().sum())
+        if rho is None:
+            raise ValueError("rho wymagane do globalnej UB.")
+        ub_global = _port_dr_upper_bound(n_port, k_port, rho, gamma, nodes)
+    else:
+        ub_global = None
+
+    for col in pd_df.columns:
+        scaled_col, K = _scale_one_pd_table(
+            pd_df[[col]], df_exposures[[col]], df_defaults[[col]],
+            method   = method,
+            gamma    = gamma,
+            rho      = rho,
+            nodes    = nodes,
+            ub_mode  = ub_mode,
+            port_dr_ub = ub_global
+        )
+        out[col]      = scaled_col[col]
+        Ks[str(col)]  = K
+
+    return out, Ks
