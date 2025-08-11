@@ -1,0 +1,106 @@
+import numpy as np
+import pandas as pd
+
+def _beta_ppf_upper_clopper_pearson(gamma: float, k: int, n: int) -> float:
+    """
+    Jednostronna górna granica Cloppera-Pearsona dla Bin(n, p) przy P[X <= k] = 1 - gamma.
+    Zwraca p_u = I^{-1}_gamma(k+1, n-k). Działa bez SciPy (bisekcja na zregularizowanej I_x).
+    """
+    if n <= 0:
+        return np.nan
+    if k >= n:  # same defaulty -> pewność
+        return 1.0
+    if k < 0:
+        return np.nan
+    # k == 0 ma formułę zamkniętą: p_u = 1 - (1 - gamma)^(1/n)
+    if k == 0:
+        return 1.0 - (1.0 - gamma)**(1.0 / n)
+
+    try:
+        # próba: SciPy (jeśli dostępny)
+        from scipy.stats import beta as _scipy_beta
+        return float(_scipy_beta.ppf(gamma, k + 1, n - k))
+    except Exception:
+        # fallback: mpmath + bisekcja
+        try:
+            import mpmath as mp
+        except Exception:
+            # ultra-fallback: numeryczna bisekcja Binom CDF wprost (wolniejsze)
+            from math import comb
+            def binom_cdf(p):
+                s = 0.0
+                one_minus = 1.0 - p
+                for i in range(0, k + 1):
+                    s += comb(n, i) * (p**i) * (one_minus**(n - i))
+                return s
+            lo, hi = 0.0, 1.0
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if binom_cdf(mid) >= 1.0 - gamma:
+                    hi = mid
+                else:
+                    lo = mid
+            return 0.5 * (lo + hi)
+
+        a, b = k + 1, n - k
+        B_ab = float(mp.beta(a, b))
+
+        def I_x(x):
+            # zregularizowana niezupełna beta: I_x(a,b) = B(x;a,b)/B(a,b)
+            return float(mp.betainc(a, b, 0, x, regularized=True))
+
+        # Szukamy x z I_x(a,b) = gamma na [0,1].
+        lo, hi = 0.0, 1.0
+        for _ in range(80):
+            mid = (lo + hi) / 2.0
+            if I_x(mid) >= gamma:
+                hi = mid
+            else:
+                lo = mid
+        return (lo + hi) / 2.0
+
+
+def pd_upper_bounds_independent(exposures: pd.DataFrame,
+                                defaults: pd.DataFrame,
+                                gamma: float) -> pd.DataFrame:
+    """
+    Sekcja 3 (Pluto & Tasche, 2005): 'Few Defaults, Assumption of Independence'
+    Wejście:
+      - exposures: DataFrame (ratingi w wierszach – od najlepszego do najgorszego; kolumny – starty kwartałów)
+      - defaults:  DataFrame tej samej struktury, liczby defaultów
+      - gamma:     poziom ufności w (0,1), np. 0.95
+    Zwraca:
+      - DataFrame PD_hat (górne granice CP) o tej samej siatce (rating x kwartał).
+    Zasada 'most prudent': dla ratingu g agregujemy (n,k) po wszystkich klasach >= g (gorszych i równej).
+    """
+    if not isinstance(exposures, pd.DataFrame) or not isinstance(defaults, pd.DataFrame):
+        raise TypeError("exposures i defaults muszą być pandas.DataFrame")
+    if exposures.shape != defaults.shape:
+        raise ValueError("Wymiary exposures i defaults muszą się zgadzać")
+    if not (0.0 < gamma < 1.0):
+        raise ValueError("gamma musi należeć do (0,1)")
+
+    # Walidacja prostych ograniczeń
+    if (exposures.values < 0).any() or (defaults.values < 0).any():
+        raise ValueError("Wartości w exposures/defaults nie mogą być ujemne")
+    if (defaults.values > exposures.values).any():
+        raise ValueError("defaults nie może przekraczać exposures")
+
+    # Suma sufiksowa po wierszach (od dołu ku górze), zachowując kolumny (kwartały)
+    n_suf = exposures.iloc[::-1].cumsum().iloc[::-1]
+    k_suf = defaults.iloc[::-1].cumsum().iloc[::-1]
+
+    # Oblicz p_u element-wise
+    n_arr = n_suf.to_numpy()
+    k_arr = k_suf.to_numpy()
+    out = np.empty_like(n_arr, dtype=float)
+
+    # Pętla po komórkach (czytelnie i wystarczająco szybko dla typowych rozmiarów)
+    rows, cols = n_arr.shape
+    for i in range(rows):
+        for j in range(cols):
+            n_ij = int(n_arr[i, j])
+            k_ij = int(k_arr[i, j])
+            out[i, j] = _beta_ppf_upper_clopper_pearson(gamma, k_ij, n_ij)
+
+    return pd.DataFrame(out, index=exposures.index, columns=exposures.columns)
