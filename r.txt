@@ -1,0 +1,65 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import beta as sp_beta  # SciPy only
+
+def heatmap_kn(gamma: float,
+               n_min: int = 1,
+               n_max: int = 300,
+               k_max: int | None = None):
+    """
+    Rysuje heatmapę p_u(k,n; gamma) dla CP-upper:
+      p_u = Beta^{-1}(gamma; k+1, n-k)
+
+    Oś X: k (liczba defaultów)
+    Oś Y: n (liczba ekspozycji)
+    Kolor: p_u
+
+    Argumenty:
+      gamma  ∈ (0,1) – poziom ufności
+      n_min  ≥ 1     – minimalne n
+      n_max  ≥ n_min – maksymalne n
+      k_max  – maksymalne k na osi X; domyślnie = n_max
+
+    Zwraca: (k_vals, n_vals, H) gdzie H[y, x] = p_u dla (n=k_vals[x], k=n_vals[y]).
+    """
+    if not (0.0 < gamma < 1.0):
+        raise ValueError("gamma musi być w (0,1)")
+    if n_min < 1 or n_max < n_min:
+        raise ValueError("wymagane: 1 ≤ n_min ≤ n_max")
+
+    n_vals = np.arange(n_min, n_max + 1, dtype=int)
+    if k_max is None:
+        k_max = n_max
+    if k_max < 0:
+        raise ValueError("k_max ≥ 0")
+    k_vals = np.arange(0, k_max + 1, dtype=int)
+
+    # Siatka (N, K)
+    N = np.repeat(n_vals[:, None], len(k_vals), axis=1)       # shape: (len(n_vals), len(k_vals))
+    K = np.repeat(k_vals[None, :], len(n_vals), axis=0)
+
+    # p_u tylko dla K <= N-1 (bo Beta(k+1, n-k) wymaga n-k > 0).
+    H = np.full_like(N, np.nan, dtype=float)
+    valid = K < N                      # tu Beta ma poprawne parametry
+    a = (K + 1)[valid]
+    b = (N - K)[valid]
+    H[valid] = sp_beta.ppf(gamma, a, b)
+
+    # Definiujemy p_u = 1.0 dla K >= N (wszystkie/więcej niż N defaultów → granica = 1)
+    H[K >= N] = 1.0
+
+    # Rysunek
+    plt.figure(figsize=(8.0, 5.0))
+    extent = [k_vals.min(), k_vals.max(), n_vals.min(), n_vals.max()]
+    plt.imshow(H, origin="lower", aspect="auto", extent=extent)
+    plt.colorbar(label="p_u (Clopper–Pearson upper bound)")
+    plt.xlabel("k (liczba defaultów)")
+    plt.ylabel("n (liczba ekspozycji)")
+    plt.title(f"p_u vs. k i n (gamma={gamma})")
+    plt.tight_layout()
+    plt.show()
+
+    return k_vals, n_vals, H
+
+# PRZYKŁAD:
+# heatmap_kn(gamma=0.95, n_min=1, n_max=250, k_max=60)
