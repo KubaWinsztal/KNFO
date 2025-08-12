@@ -1,140 +1,163 @@
 import numpy as np
 import pandas as pd
-from typing import Literal, Optional
-from scipy.stats import norm
-from scipy.special import betainc
-from numpy.polynomial.hermite import hermgauss
+import matplotlib.pyplot as plt
+from scipy.stats import beta as sp_beta  # <-- tylko SciPy
 
+# ------------------------------------------------------------
+# 0) PARAMETRY (możesz zmieniać)
+# ------------------------------------------------------------
+GAMMAS = [0.90, 0.95, 0.99]         # poziomy ufności do heatmap
+N_MIN, N_MAX, N_STEP = 20, 200, 10  # zakres N (most-prudent sample size)
+R_MIN, R_MAX, R_POINTS = 0.0, 0.06, 121  # zakres K/N i gęstość siatki
+RATINGS_R = 9                       # liczba ratingów w przykładzie ścieżki
+SEED_START = 33                     # start ziarna do przykładu ścieżki
+TRIES_FOR_INVERSION = 25            # próby znalezienia odwrócenia
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  1.  pomocnicze — wyliczenie górnej granicy DR portfela
-# ────────────────────────────────────────────────────────────────────────────────
-def _port_dr_upper_bound(n_tot: int, k_tot: int,
-                         rho: float, gamma: float, nodes: int = 60) -> float:
-    """Most-prudent upper bound PD for the whole portfolio (sekcje 2-4)."""
-    if k_tot > n_tot:
-        raise ValueError("k_tot > n_tot")
-    a, b = k_tot + 1, n_tot - k_tot
-    x, w = hermgauss(nodes)
-    ys = np.sqrt(2) * x
-    ws = w / np.sqrt(np.pi)
+# ------------------------------------------------------------
+# 1) Clopper–Pearson upper bound p_u (tylko SciPy)
+# ------------------------------------------------------------
+def cp_upper(gamma: float, k: int, n: int) -> float:
+    if n <= 0:
+        return np.nan
+    if k >= n:
+        return 1.0
+    # dla wszystkich k (włącznie z k=0) używamy sp_beta.ppf:
+    # p_u = Beta^{-1}(gamma; k+1, n-k)
+    return float(sp_beta.ppf(gamma, k + 1, n - k))
 
-    lo, hi = 1e-8, 0.5
-    target = 1.0 - gamma
-    for _ in range(200):
-        mid = 0.5 * (lo + hi)
-        z = norm.ppf(mid)
-        q = norm.cdf((z - np.sqrt(rho) * ys) / np.sqrt(1 - rho))
-        g_val = np.dot(ws, 1.0 - betainc(a, b, q))
-        if g_val >= target:
-            lo = mid
-        else:
-            hi = mid
-        if hi - lo < 1e-8:
-            break
-    return lo
+# ------------------------------------------------------------
+# 2) HEATMAPA p_u vs. (K/N, N)
+# ------------------------------------------------------------
+def heatmap_pu(gamma=0.95,
+               N_min=20, N_max=200, N_step=10,
+               r_min=0.0, r_max=0.06, r_points=121,
+               title_suffix=""):
+    N_vals = np.arange(N_min, N_max + 1, N_step, dtype=int)
+    r_vals = np.linspace(r_min, r_max, r_points)
+    H = np.empty((len(N_vals), len(r_vals)), dtype=float)
 
+    for i, N in enumerate(N_vals):
+        for j, r in enumerate(r_vals):
+            K = int(np.floor(r * N))
+            H[i, j] = cp_upper(gamma, K, N)
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  2.  skalowanie jednej tabelki (sekcja 5)  —  wersja skrócona
-# ────────────────────────────────────────────────────────────────────────────────
-def _scale_one_pd_table(
-    pd_df: pd.DataFrame,
-    df_exp: pd.DataFrame,
-    df_def: pd.DataFrame,
-    *,
-    method: Literal["observed", "upper_bound"] = "upper_bound",
-    gamma: float = 0.75,
-    rho: Optional[float] = None,
-    nodes: int = 60,
-    port_dr_ub: Optional[float] = None
-) -> tuple[pd.DataFrame, float]:
+    plt.figure(figsize=(7.6, 4.8))
+    extent = [r_min, r_max, N_min, N_max]
+    plt.imshow(H, aspect='auto', origin='lower', extent=extent)
+    plt.colorbar(label="p_u (Clopper–Pearson upper bound)")
+    plt.xlabel("K / N (empirical default ratio)")
+    plt.ylabel("N (most-prudent sample size)")
+    ttl = f"p_u vs. K/N and N (gamma={gamma})"
+    if title_suffix:
+        ttl += f" — {title_suffix}"
+    plt.title(ttl)
+    plt.tight_layout()
+    return (N_vals, r_vals, H)
 
-    # ---- walidacja układu -----------------------------------
-    if not (pd_df.index.equals(df_exp.index) and pd_df.columns.equals(df_exp.columns) and
-            pd_df.index.equals(df_def.index) and pd_df.columns.equals(df_def.columns)):
-        raise ValueError("pd_df / exposures / defaults muszą mieć identyczny układ.")
+# ------------------------------------------------------------
+# 3) GENERATOR ŚCIEŻKI „MOST-PRUDENT” + WYKRYWANIE ODWROTÓW
+# ------------------------------------------------------------
+def random_most_prudent_path(R=8, seed=33):
+    rng = np.random.default_rng(seed)
+    # inkrementalne ekspozycje per rating (losowe, malejące po sortowaniu)
+    base = rng.integers(60, 180, size=R)
+    base.sort(); base = base[::-1]
+    exposures_incr = base
+    # mało-defaultowy reżim – intensywność rośnie ku gorszemu ratingowi
+    lam = np.linspace(0.2, 1.4, R)
+    defaults_incr = rng.poisson(lam).astype(int)
 
-    # ---- średnia ważona surowych PD -------------------------
-    w_per_rating = df_exp.sum(axis=1).astype(float)
-    mean_upper = float((pd_df * w_per_rating).to_numpy().sum() / w_per_rating.sum())
-    if mean_upper == 0:
-        raise ValueError("Mean upper PD == 0")
+    # sufiksy (most-prudent): N_g = sum_{h>=g} e_h, K_g = sum_{h>=g} d_h
+    N_suffix = np.flip(np.cumsum(np.flip(exposures_incr)))
+    K_suffix = np.flip(np.cumsum(np.flip(defaults_incr)))
+    return N_suffix.astype(int), K_suffix.astype(int), exposures_incr, defaults_incr
 
-    k_tot = int(df_def.to_numpy().sum())
-    n_tot = int(df_exp.to_numpy().sum())
+def pd_path_from_suffix(N_suffix, K_suffix, gamma=0.95):
+    R = len(N_suffix)
+    PD = np.array([cp_upper(gamma, int(K_suffix[i]), int(N_suffix[i])) for i in range(R)], dtype=float)
+    return PD
 
-    # ---- central target ------------------------------------
-    if method == "observed":
-        central = k_tot / n_tot if n_tot else 0.0
-    elif method == "upper_bound":
-        if port_dr_ub is not None:
-            central = port_dr_ub
-        else:
-            if rho is None:
-                raise ValueError("rho required for upper_bound when port_dr_ub not given")
-            central = _port_dr_upper_bound(n_tot, k_tot, rho, gamma, nodes)
+def find_path_with_inversion(R=9, seed_start=33, tries=25, gamma=0.95):
+    seed = seed_start
+    for _ in range(tries):
+        N_suf, K_suf, e_incr, d_incr = random_most_prudent_path(R=R, seed=seed)
+        PD = pd_path_from_suffix(N_suf, K_suf, gamma=gamma)
+        inv_idx = np.where(PD[:-1] < PD[1:])[0]  # miejsca, gdzie PD_g < PD_{g+1}
+        if inv_idx.size > 0:
+            return {
+                "seed": seed, "N_suffix": N_suf, "K_suffix": K_suf,
+                "exposures_incr": e_incr, "defaults_incr": d_incr,
+                "PD": PD, "inversions": inv_idx
+            }
+        seed += 1
+    # jeśli nie znaleziono – zwróć ostatnią próbę (bez odwróceń)
+    return {
+        "seed": seed, "N_suffix": N_suf, "K_suffix": K_suf,
+        "exposures_incr": e_incr, "defaults_incr": d_incr,
+        "PD": PD, "inversions": np.array([], dtype=int)
+    }
+
+def plot_pd_path(result, gamma=0.95):
+    PD = result["PD"]
+    N_suf = result["N_suffix"]; K_suf = result["K_suffix"]
+    inv = result["inversions"]
+    R = len(PD); x = np.arange(1, R + 1)
+
+    # wykres PD po ratingach
+    plt.figure(figsize=(7.4, 4.2))
+    plt.plot(x, PD, marker='o', linewidth=1.5)
+    if inv.size > 0:
+        # zaznacz punkty, gdzie monotoniczność się wywala (PD_g < PD_{g+1})
+        for j in inv:
+            plt.scatter([j+1, j+2], [PD[j], PD[j+1]], s=80, marker='x')
+    plt.xticks(x)
+    plt.xlabel("Rating index (1=best → R=worst)")
+    plt.ylabel("p_u (CP upper bound)")
+    ttl = f"Most-prudent PD path (gamma={gamma})"
+    if inv.size > 0:
+        ttl += " — INVERSION(S) MARKED"
+    plt.title(ttl)
+    plt.grid(True, axis='y', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+
+    # wykres K/N po ratingach
+    ratios = K_suf / N_suf
+    plt.figure(figsize=(7.4, 4.2))
+    plt.plot(x, ratios, marker='o', linewidth=1.5)
+    plt.xticks(x)
+    plt.xlabel("Rating index (1=best → R=worst)")
+    plt.ylabel("K/N (empirical default ratio)")
+    plt.title("Most-prudent suffix ratios K/N along ratings")
+    plt.grid(True, axis='y', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+
+# ------------------------------------------------------------
+# 4) „MAIN”: generacja heatmap + ścieżki z odwróceniami
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # HEATMAPY
+    for g in GAMMAS:
+        heatmap_pu(gamma=g,
+                   N_min=N_MIN, N_max=N_MAX, N_step=N_STEP,
+                   r_min=R_MIN, r_max=R_MAX, r_points=R_POINTS)
+
+    # ŚCIEŻKA most-prudent z zaznaczonymi odwróceniami (jeśli uda się znaleźć)
+    res = find_path_with_inversion(R=RATINGS_R, seed_start=SEED_START,
+                                   tries=TRIES_FOR_INVERSION, gamma=0.95)
+
+    # Diagnostyka w konsoli:
+    print("\n--- most-prudent path diagnostics ---")
+    print(f"seed used: {res['seed']}")
+    print("incremental exposures:", res["exposures_incr"])
+    print("incremental defaults :", res["defaults_incr"])
+    print("suffix N:", res["N_suffix"])
+    print("suffix K:", res["K_suffix"])
+    print("PD path :", np.array2string(res["PD"], precision=6))
+    if res["inversions"].size > 0:
+        print("INVERSION indices (between i and i+1):", res["inversions"])
     else:
-        raise ValueError("unknown method")
+        print("No adjacent inversions found in PD path.")
 
-    K = central / mean_upper
-    return pd_df * K, K
+    plot_pd_path(res, gamma=0.95)
 
-
-# ────────────────────────────────────────────────────────────────────────────────
-#  3.  wrapper z parametrem  scope = "global" / "per_period"
-# ────────────────────────────────────────────────────────────────────────────────
-def scale_pd(
-    pd_df: pd.DataFrame,
-    df_exposures: pd.DataFrame,
-    df_defaults: pd.DataFrame,
-    *,
-    scope: Literal["global", "per_period"] = "global",
-    method: Literal["observed", "upper_bound"] = "upper_bound",
-    gamma: float = 0.75,
-    rho: Optional[float] = None,
-    nodes: int = 60,
-    # pozwala podać gotowe upper boundy per okres lub globalnie
-    port_dr_ub: Optional[float | dict[str, float]] = None,
-) -> tuple[pd.DataFrame, dict[str, float]]:
-    """
-    Skaluje górne granice PD (sekcja 5) na dwa sposoby:
-    - scope="global"  →  jedno skalowanie dla całego okresu T,
-    - scope="per_period" → osobne skalowanie dla każdej kolumny.
-
-    Zwraca:
-        scaled_df  – PD po skalowaniu (ten sam układ co wejście),
-        K_dict     – słownik współczynników K (klucz = kolumna lub "GLOBAL")
-    """
-    if scope == "global":
-        scaled, K = _scale_one_pd_table(
-            pd_df, df_exposures, df_defaults,
-            method=method, gamma=gamma, rho=rho,
-            nodes=nodes,
-            port_dr_ub=port_dr_ub if isinstance(port_dr_ub, float) else None
-        )
-        return scaled, {"GLOBAL": K}
-
-    elif scope == "per_period":
-        Ks: dict[str, float] = {}
-        out = pd.DataFrame(index=pd_df.index, columns=pd_df.columns, dtype=float)
-
-        for col in pd_df.columns:
-            scaled_col, K = _scale_one_pd_table(
-                pd_df[[col]],
-                df_exposures[[col]],
-                df_defaults[[col]],
-                method=method,
-                gamma=gamma,
-                rho=rho,
-                nodes=nodes,
-                port_dr_ub=(
-                    port_dr_ub[col] if isinstance(port_dr_ub, dict) and col in port_dr_ub else None
-                )
-            )
-            out[col] = scaled_col[col]
-            Ks[str(col)] = K
-        return out, Ks
-
-    else:
-        raise ValueError("scope must be 'global' or 'per_period'")
+    plt.show()
