@@ -1,0 +1,310 @@
+# Implementation of Section 6 (multi-period upper PD bounds) following the user's 6-step recipe.
+#
+# Inputs:
+# - df_defaults_cum:  DataFrame [ratings x periods] with cumulative default counts per rating & period
+# - df_exposure_cum:  DataFrame [ratings x periods] with cumulative exposure counts per rating & period
+#                      (we'll use the first column as starting cohort size for each rating)
+# - rho:              asset correlation (float in (0,1))
+# - theta:            intertemporal correlation parameter (float in (0,1)), AR(1)-like: COV[i,j] = theta**|i-j|
+# - gamma:            confidence level for the *upper* one-sided bound (e.g., 0.95)
+# - n_mc:             number of MC paths (default 100_000)
+# - importance:       {"none","identity"}  (identity = optional importance sampling with proposal N(0,I_T))
+# - use_beta_moment_approx: if True, additionally return a closed-form Beta approximation of the binomial mixture
+#
+# Output:
+# - DataFrame with per-rating upper PD bounds (most-prudent pooling), along with diagnostics.
+#
+# Notes:
+# - We implement the law-of-total-probability estimator:
+#     P(M<=k) = E[ BinomialCDF(k; N, pi(S)) ],
+#   where pi(S) = 1 - Prod_t (1 - G(p, rho, S_t)),
+#         G(p, rho, s) = Phi( (Phi^{-1}(p) - sqrt(rho) * s) / sqrt(1 - rho) ).
+# - We then find the largest p such that  P(M<=k) >= 1 - gamma  (bisection search).
+#
+# - Most-prudent pooling:
+#     For rating r (0 = best row), pool rows r..end for (N, k).
+#
+# - Two MC modes:
+#   * importance="none": sample S ~ N(0, COV) directly via Cholesky (no weights).
+#   * importance="identity": proposal is N(0, I), target is N(0, COV). Weights w = phi_COV(s) / phi_I(s).
+#
+# - Optional Beta moment approximation (logit-normal ≈ Beta) for the inner expectation E[ pi^l (1-pi)^(N-l) ],
+#   using a,b matched to sample mean/var of pi(S). This is an approximation; MC remains the reference.
+#
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from numpy.linalg import cholesky, slogdet
+from scipy.stats import norm, binom, beta
+from scipy.special import betaln
+from typing import Tuple, Dict, Any, Optional, Callable
+
+Array = np.ndarray
+
+
+def _build_cov(theta: float, T: int) -> Array:
+    idx = np.arange(T)
+    # Toeplitz with theta**|i-j|
+    return theta ** np.abs(idx[:, None] - idx[None, :])
+
+
+def _chol_psd(Sigma: Array) -> Array:
+    # Cholesky; theta in (0,1) makes Sigma PD. Add tiny jitter if needed.
+    jitter = 0.0
+    for _ in range(5):
+        try:
+            L = cholesky(Sigma + jitter * np.eye(Sigma.shape[0]))
+            return L
+        except np.linalg.LinAlgError:
+            jitter = 1e-12 if jitter == 0.0 else jitter * 10
+    raise np.linalg.LinAlgError("Cholesky failed; covariance may not be PD.")
+
+
+def _mvnorm_logpdf(s: Array, Sigma: Array, L: Optional[Array] = None) -> Array:
+    """
+    Compute log pdf of N(0, Sigma) at vectors s with shape (T, M) using Cholesky if provided.
+    Returns array of shape (M,).
+    """
+    T, M = s.shape
+    if L is None:
+        L = _chol_psd(Sigma)
+    # Solve for x = L^{-1} s  (since Sigma^{-1} = (L^{-T} L^{-1}))
+    x = np.linalg.solve(L, s)              # shape (T, M)
+    quad = (x * x).sum(axis=0)             # (M,)
+    sign, logdet = slogdet(Sigma)
+    if sign <= 0:
+        raise ValueError("Sigma not PD (non-positive determinant).")
+    return -0.5 * (T * np.log(2 * np.pi) + logdet + quad)
+
+
+def _pi_from_S(p: float, rho: float, S: Array) -> Array:
+    """
+    Given p (scalar), rho (scalar), and S shape (T, M), compute pi(S) for each Monte Carlo column.
+    Returns (M,).
+    """
+    T, M = S.shape
+    # G_t = Phi((Phi^{-1}(p) - sqrt(rho) S_t)/sqrt(1-rho))
+    z = (norm.ppf(p) - np.sqrt(rho) * S) / np.sqrt(1.0 - rho)  # (T, M)
+    G = norm.cdf(z)                                            # (T, M)
+    one_minus_G = 1.0 - G
+    prod_term = np.prod(one_minus_G, axis=0)                   # (M,)
+    return 1.0 - prod_term                                     # (M,)
+
+
+def _tail_prob_leq_k_given_pi(N: int, k: int, pi: Array) -> Array:
+    """
+    Compute Binomial CDF P[M<=k | pi] for each pi in (M,).
+    Uses scipy vectorized binom.cdf for stability.
+    """
+    return binom.cdf(k, N, pi)
+
+
+def _estimate_tail_prob(
+    p: float,
+    N: int,
+    k: int,
+    rho: float,
+    L_cov: Array,
+    n_mc: int = 100_000,
+    importance: str = "none",
+    rng: np.random.Generator | None = None,
+) -> float:
+    """
+    Estimate P(M <= k) = E[ BinomCDF(k; N, pi(S)) ] under S ~ N(0, COV).
+    importance: "none" (direct sampling) or "identity" (proposal N(0,I) weights = phi_COV/phi_I).
+    """
+    T = L_cov.shape[0]
+    rng = np.random.default_rng() if rng is None else rng
+
+    if importance == "none":
+        Z = rng.standard_normal(size=(T, n_mc))  # iid
+        S = L_cov @ Z                             # correlate: S ~ N(0, COV)
+        pi = _pi_from_S(p, rho, S)               # (n_mc,)
+        cdf_vals = _tail_prob_leq_k_given_pi(N, k, pi)
+        return float(np.mean(cdf_vals))
+
+    elif importance == "identity":
+        # Proposal: s_proposal ~ N(0, I). Weight by ratio target/proposal.
+        S = rng.standard_normal(size=(T, n_mc))  # proposal
+        # log w = log phi_COV(S) - log phi_I(S)
+        # phi_I is standard MVN with Sigma = I
+        logphi_target = _mvnorm_logpdf(S, Sigma=L_cov @ L_cov.T, L=L_cov)
+        quad_I = 0.5 * np.sum(S * S, axis=0)  # since log phi_I = -0.5*(T*log(2π) + s^Ts)
+        logphi_proposal = -0.5 * (T * np.log(2 * np.pi)) - quad_I
+        logw = logphi_target - logphi_proposal
+        w = np.exp(logw - np.max(logw))  # stabilize
+        w = w / np.mean(w)               # de-bias scaling (optional)
+        pi = _pi_from_S(p, rho, S)
+        cdf_vals = _tail_prob_leq_k_given_pi(N, k, pi)
+        return float(np.mean(cdf_vals * w))
+    else:
+        raise ValueError("importance must be 'none' or 'identity'.")
+
+
+def _find_upper_pd_for_pool(
+    N: int,
+    k: int,
+    rho: float,
+    theta: float,
+    T: int,
+    gamma: float,
+    n_mc: int = 100_000,
+    importance: str = "none",
+    tol: float = 1e-6,
+    max_iter: int = 60,
+    rng: np.random.Generator | None = None,
+) -> Dict[str, Any]:
+    """
+    Find upper one-sided bound p_hat such that
+       P(M <= k; p_hat) >= 1 - gamma
+    and p_hat is maximal.
+    Returns dict with p_hat and diagnostics.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    COV = _build_cov(theta, T)
+    L = _chol_psd(COV)
+
+    target = 1.0 - gamma
+
+    # Helper
+    def F(p: float) -> float:
+        return _estimate_tail_prob(p, N, k, rho, L, n_mc=n_mc, importance=importance, rng=rng)
+
+    # Monotone decreasing in p; bracket.
+    lo, hi = 1e-10, 0.5  # start
+    f_lo = F(lo)
+    f_hi = F(hi)
+    # ensure f_lo >= target; if not, increase randomness? but for tiny p it should be near 1.
+    if f_lo < target:
+        # Should not happen; fallback
+        lo = 1e-12
+        f_lo = F(lo)
+
+    # increase hi until below target or reach cap
+    while f_hi >= target and hi < 0.999999:
+        hi = min(0.999999, hi * 1.8 + 1e-6)
+        f_hi = F(hi)
+
+    # If even at p≈1 CDF still >= target, then bound is  ~1 (degenerate); cap at 0.999999
+    if f_hi >= target and hi >= 0.999999:
+        return {"p_hat": 0.999999, "bracket": (lo, hi), "F(lo)": f_lo, "F(hi)": f_hi, "N": N, "k": k}
+
+    # Bisection for largest p with F(p) >= target
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        f_mid = F(mid)
+        if f_mid >= target:
+            lo = mid
+            f_lo = f_mid
+        else:
+            hi = mid
+            f_hi = f_mid
+        if abs(hi - lo) < tol * max(1.0, lo):
+            break
+
+    return {"p_hat": lo, "bracket": (lo, hi), "F(lo)": f_lo, "F(hi)": f_hi, "N": N, "k": k}
+
+
+def _beta_moment_approx(
+    pi_samples: Array, N: int, k: int
+) -> float:
+    """
+    Optional Beta approximation of E[ BinomCDF(k; N, pi) ]:
+      Approximate pi ~ Beta(a,b) by matching mean & variance of pi_samples (clipped to (0,1)).
+      Then compute E[pi^l (1-pi)^(N-l)] in closed form via Beta functions, and sum over l<=k.
+    Returns approximate tail probability.
+    """
+    x = np.clip(pi_samples, 1e-12, 1 - 1e-12)
+    m = float(np.mean(x))
+    v = float(np.var(x, ddof=1))
+    # Match Beta: a = m*(m*(1-m)/v - 1), b = (1-m)*(m*(1-m)/v - 1)
+    # Guard small v
+    eps = 1e-12
+    t = max(m * (1 - m) / max(v, eps) - 1.0, 1e-6)
+    a = max(m * t, 1e-6)
+    b = max((1 - m) * t, 1e-6)
+    # E[pi^l (1-pi)^(N-l)] = B(a+l, b+N-l) / B(a,b)
+    l_vals = np.arange(0, k + 1)
+    num = np.exp(betaln(a + l_vals, b + N - l_vals))
+    den = np.exp(betaln(a, b))
+    terms = num / den * (np.fromiter((np.math.comb(N, l) for l in l_vals), dtype=float))
+    return float(np.sum(terms))
+
+
+def compute_upper_pd_bounds(
+    df_defaults_cum: pd.DataFrame,
+    df_exposure_cum: pd.DataFrame,
+    rho: float,
+    theta: float,
+    gamma: float = 0.95,
+    n_mc: int = 100_000,
+    importance: str = "none",
+    use_beta_moment_approx: bool = False,
+    random_seed: Optional[int] = 42,
+) -> pd.DataFrame:
+    """
+    High-level driver. Implements the user's steps 1–6 and returns a per-rating result table.
+    """
+    assert df_defaults_cum.shape == df_exposure_cum.shape, "Shapes of defaults/exposures must match."
+    ratings = list(df_defaults_cum.index)
+    T = df_defaults_cum.shape[1]
+
+    # --- Step 1: build pooled (N,k) per rating (most-prudent pooling) ---
+    # N_r = starting cohort size at rating r (first column of exposure, pooled r..end)
+    # k_r = total defaults to horizon T at rating r (last column of defaults, pooled r..end)
+    exp0 = df_exposure_cum.iloc[:, 0].to_numpy(dtype=float)        # (R,)
+    defT = df_defaults_cum.iloc[:, -1].to_numpy(dtype=float)        # (R,)
+    R = len(ratings)
+
+    Ns = []
+    ks = []
+    for r in range(R):
+        N_pool = float(np.sum(exp0[r:]))
+        k_pool = float(np.sum(defT[r:]))
+        Ns.append(int(N_pool))
+        ks.append(int(k_pool))
+
+    # --- Step 2 & 3: Covariance + Cholesky ---
+    COV = _build_cov(theta, T)
+    L_cov = _chol_psd(COV)
+
+    # --- Monte Carlo search per rating ---
+    rng = np.random.default_rng(random_seed)
+    out_rows = []
+    for r in range(R):
+        N, k = Ns[r], ks[r]
+        res = _find_upper_pd_for_pool(
+            N=N, k=k, rho=rho, theta=theta, T=T, gamma=gamma, n_mc=n_mc,
+            importance=importance, rng=rng
+        )
+        row = {"rating": ratings[r], "N_pool": N, "k_pool": k, "p_hat_MC": res["p_hat"]}
+        # Optional: Beta approximation (diagnostic)
+        if use_beta_moment_approx:
+            # Draw a modest MC cloud to fit a,b for pi(S)
+            Z = rng.standard_normal(size=(T, min(50_000, n_mc)))
+            S = L_cov @ Z
+            pi_smpl = _pi_from_S(res["p_hat"], rho, S)
+            row["tail_prob_beta_approx"] = _beta_moment_approx(pi_smpl, N, k)
+        out_rows.append(row)
+
+    return pd.DataFrame(out_rows)
+
+
+# -------------------
+# Minimal example scaffold (commented). Uncomment and adapt with real data.
+# -------------------
+# # Example dummy data (3 ratings x 5 years):
+# idx = ["A", "B", "C"]
+# cols = [f"Y{t+1}" for t in range(5)]
+# df_defaults_cum = pd.DataFrame([[0,0,0,1,1],
+#                                 [0,0,1,1,2],
+#                                 [0,1,1,2,3]], index=idx, columns=cols)
+# df_exposure_cum = pd.DataFrame([[100,100,100,100,100],
+#                                 [200,200,200,200,200],
+#                                 [150,150,150,150,150]], index=idx, columns=cols)
+# res = compute_upper_pd_bounds(df_defaults_cum, df_exposure_cum,
+#                               rho=0.15, theta=0.5, gamma=0.95,
+#                               n_mc=50_000, importance="none",
+#                               use_beta_moment_approx=True, random_seed=1)
+# res
