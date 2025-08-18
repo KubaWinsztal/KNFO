@@ -1,0 +1,196 @@
+import numpy as np
+import pandas as pd
+from typing import Sequence, Tuple, Optional, Dict, Any, Union
+from numpy.polynomial.hermite import hermgauss
+from scipy.stats import norm
+from scipy.optimize import minimize_scalar
+from scipy.special import gammaln
+
+# ─────────────────────────────────────────────────────────────────────
+#  A. Pomocnicze: sanity checks, przygotowanie PD, GH, stabilna binom
+# ─────────────────────────────────────────────────────────────────────
+
+def _as_p_vector(p_by_rating: Union[Sequence[float], pd.Series],
+                 index: pd.Index) -> np.ndarray:
+    """
+    Zwróć PD jako wektor w kolejności indexu ratingów.
+    Jeśli podasz Series z indexem ratingów, zostanie dopasowana po nazwach.
+    Jeśli lista/np.array – zakładamy, że już jest w kolejności indexu.
+    Dodatkowo wykrywamy PD w % i przeskalowujemy do (0,1).
+    """
+    if isinstance(p_by_rating, pd.Series):
+        missing = index.difference(p_by_rating.index)
+        if len(missing) > 0:
+            raise ValueError(f"Brakuje PD dla ratingów: {list(missing)}")
+        p = p_by_rating.reindex(index).to_numpy(dtype=float)
+    else:
+        p = np.asarray(p_by_rating, dtype=float)
+        if len(p) != len(index):
+            raise ValueError("Długość p_by_rating ≠ liczbie ratingów (wierszy).")
+    # wykryj wartości w procentach: np. 0.5, 1.2, 3.0 → dzielimy przez 100
+    if np.nanmax(p) > 0.3:  # heurystyka
+        p = p / 100.0
+    # klipy numeryczne
+    p = np.clip(p, 1e-12, 1-1e-12)
+    return p
+
+def _sanity_inputs(df_exp: pd.DataFrame, df_def: pd.DataFrame, p_vec: np.ndarray):
+    if not (df_exp.index.equals(df_def.index) and df_exp.columns.equals(df_def.columns)):
+        raise ValueError("exposures/defaults muszą mieć identyczne index i columns.")
+    if (df_exp.to_numpy() < 0).any() or (df_def.to_numpy() < 0).any():
+        raise ValueError("Ujemne n lub k.")
+    if (df_def.to_numpy() > df_exp.to_numpy()).any():
+        raise ValueError("Znaleziono komórki z k>n.")
+    if len(p_vec) != len(df_exp.index):
+        raise ValueError("PD vector długości ≠ liczbie ratingów.")
+    if (df_exp.sum(axis=1) == 0).any():
+        raise ValueError("Co najmniej jeden rating ma łączną ekspozycję n=0.")
+
+def gh_nodes(n: int = 60):
+    x, w = hermgauss(n)                  # kwadratura dla ∫ e^{-x^2} g(x) dx
+    y = np.sqrt(2.0) * x                 # zmiana zmiennych do ∫ φ(y) f(y) dy
+    lw = np.log(w) - 0.5 * np.log(np.pi) # log(w/√π) → stabilna suma logów
+    return y, lw
+
+def log_binom_pmf(k: int, n: int, q: np.ndarray) -> np.ndarray:
+    if n == 0:
+        return np.zeros_like(q)
+    if k < 0 or k > n:
+        return np.full_like(q, -np.inf, dtype=float)
+    q = np.clip(q, 1e-15, 1-1e-15)
+    logC = gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
+    return logC + k*np.log(q) + (n-k)*np.log1p(-q)
+
+def vasicek_cond_pd(p: float, rho: float, y: np.ndarray) -> np.ndarray:
+    z = norm.ppf(np.clip(p, 1e-12, 1-1e-12))
+    s = np.sqrt(np.clip(rho, 1e-12, 1-1e-12))
+    return norm.cdf((z - s*y)/np.sqrt(1 - s*s))
+
+def log_mixed_binom_prob(n: int, k: int, p: float, rho: float,
+                         y: np.ndarray, lw: np.ndarray) -> float:
+    if n == 0:
+        return 0.0
+    q = vasicek_cond_pd(p, rho, y)
+    lp = log_binom_pmf(k, n, q)         # log PMF na węzłach
+    m = np.max(lw + lp)
+    return float(m + np.log(np.sum(np.exp(lw + lp - m))))  # log-sum-exp
+
+# ─────────────────────────────────────────────────────────────────────
+#  B. Log-wiarygodność, profil i dopasowanie ρ
+# ─────────────────────────────────────────────────────────────────────
+
+def negloglik_rho(rho: float,
+                  df_exposures: pd.DataFrame,
+                  df_defaults: pd.DataFrame,
+                  p_by_rating: Union[Sequence[float], pd.Series],
+                  nodes: int = 60) -> float:
+    rho = float(rho)
+    # Odrzucamy ewidentnie złe zakresy, zwłaszcza przy płaskiej LL:
+    if not (1e-8 < rho < 0.999):
+        return np.inf
+    p_vec = _as_p_vector(p_by_rating, df_exposures.index)
+    _sanity_inputs(df_exposures, df_defaults, p_vec)
+
+    y, lw = gh_nodes(nodes)
+    n_mat = df_exposures.to_numpy(dtype=np.int64)
+    k_mat = df_defaults.to_numpy(dtype=np.int64)
+
+    total = 0.0
+    G, T = n_mat.shape
+    for g in range(G):
+        p = float(p_vec[g])
+        for t in range(T):
+            n = int(n_mat[g, t]);  k = int(k_mat[g, t])
+            if n == 0:
+                continue
+            total += log_mixed_binom_prob(n, k, p, rho, y, lw)
+    return -total
+
+def profile_lik_rho(df_exposures: pd.DataFrame,
+                    df_defaults: pd.DataFrame,
+                    p_by_rating: Union[Sequence[float], pd.Series],
+                    bounds: Tuple[float, float] = (1e-4, 0.5),
+                    nodes: int = 60,
+                    grid: int = 60) -> pd.DataFrame:
+    """Policz profil negloglik na siatce – do diagnozy."""
+    rs = np.linspace(bounds[0], bounds[1], grid)
+    vals = [negloglik_rho(r, df_exposures, df_defaults, p_by_rating, nodes) for r in rs]
+    return pd.DataFrame({"rho": rs, "negloglik": vals})
+
+def fit_rho_mle(df_exposures: pd.DataFrame,
+                df_defaults: pd.DataFrame,
+                p_by_rating: Union[Sequence[float], pd.Series],
+                bounds: Tuple[float, float] = (1e-4, 0.5),
+                nodes: int = 60) -> Dict[str, Any]:
+    """
+    Strategia: (1) profil na grubej siatce → r0,
+               (2) lokalne doprecyzowanie bounded,
+               (3) walidacja, czy nie trafiliśmy w brzeg (oznaka słabej identyfikacji).
+    """
+    prof = profile_lik_rho(df_exposures, df_defaults, p_by_rating, bounds, nodes, grid=60)
+    i0 = int(np.argmin(prof["negloglik"].to_numpy()))
+    r0 = float(prof["rho"].iloc[i0])
+
+    span = 0.1*(bounds[1]-bounds[0])
+    lo = max(bounds[0], r0 - span)
+    hi = min(bounds[1], r0 + span)
+
+    obj = lambda r: negloglik_rho(r, df_exposures, df_defaults, p_by_rating, nodes)
+    res = minimize_scalar(obj, bounds=(lo, hi), method="bounded",
+                          options={"xatol": 1e-6, "maxiter": 800})
+
+    rho_hat = float(res.x)
+    info = {
+        "rho_hat": rho_hat,
+        "negloglik": float(res.fun),
+        "success": bool(res.success),
+        "message": str(res.message),
+        "grid_min": r0,
+        "grid_min_nll": float(prof["negloglik"].iloc[i0]),
+        "hit_lower_bound": np.isclose(rho_hat, bounds[0], atol=1e-4),
+        "hit_upper_bound": np.isclose(rho_hat, bounds[1], atol=1e-4),
+        "nodes": nodes
+    }
+    return info
+
+# ─────────────────────────────────────────────────────────────────────
+#  C. Szybka replika syntetyczna (test samosprawdzający)
+# ─────────────────────────────────────────────────────────────────────
+
+def simulate_vasicek_counts(p_by_rating: Sequence[float],
+                            n_by_rating: Sequence[int],
+                            T: int, rho_true: float,
+                            rng: Optional[np.random.Generator] = None):
+    """Symuluj k_{g,t} przy wspólnym S_t i progach z p_by_rating."""
+    rng = rng or np.random.default_rng(123)
+    G = len(p_by_rating)
+    index = list(range(G)); cols = list(range(T))
+    df_exp = pd.DataFrame(np.repeat(np.asarray(n_by_rating)[:,None], T, axis=1),
+                          index=index, columns=cols)
+    df_def = pd.DataFrame(0, index=index, columns=cols, dtype=int)
+    S = rng.standard_normal(T)
+    for g in range(G):
+        c = norm.ppf(p_by_rating[g])
+        for t in range(T):
+            n = int(df_exp.iloc[g, t])
+            eps = rng.standard_normal(n)
+            V = np.sqrt(rho_true)*S[t] + np.sqrt(1-rho_true)*eps
+            df_def.iloc[g, t] = int(np.sum(V <= c))
+    return df_exp, df_def
+
+def self_check_demo():
+    """Szybki test: czy odzyskujemy ~ρ_true na danych syntetycznych?"""
+    G, T = 8, 6
+    p = np.linspace(0.003, 0.02, G)
+    n = (1000*np.ones(G)).astype(int)
+    rho_true = 0.12
+    df_exp, df_def = simulate_vasicek_counts(p, n, T, rho_true)
+    out = fit_rho_mle(df_exp, df_def, p, bounds=(1e-4, 0.5), nodes=60)
+    return rho_true, out
+
+# # Przykład użycia (z Twoimi danymi):
+# res = fit_rho_mle(df_exposures, df_defaults, p_by_rating, bounds=(1e-4, 0.5), nodes=60)
+# print(res)
+# # Diagnostyka profilu:
+# prof = profile_lik_rho(df_exposures, df_defaults, p_by_rating)
+# print(prof.sort_values("negloglik").head())
