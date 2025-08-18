@@ -1,0 +1,196 @@
+import numpy as np
+import pandas as pd
+from typing import Sequence, Tuple, Optional, Dict, Any
+from numpy.polynomial.hermite import hermgauss
+from scipy.stats import norm
+from scipy.optimize import minimize_scalar
+from math import log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core building blocks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gh_nodes(n: int = 60) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Gauss–Hermite nodes/weights for ∫ φ(y) f(y) dy.
+    Returns:
+        y  : transformed nodes  (shape [n]) with y = √2 * x
+        lw : log-weights for the φ-weighted integral, i.e. log(w/√π)
+    """
+    x, w = hermgauss(n)                 # for ∫ e^{-x^2} g(x) dx
+    y = np.sqrt(2.0) * x
+    lw = np.log(w) - 0.5 * np.log(np.pi)
+    return y, lw
+
+
+def vasicek_cond_pd(p: float, rho: float, y: np.ndarray) -> np.ndarray:
+    """
+    Conditional PD q(y) in the one-factor Vasicek model.
+    Args:
+        p   : TTC PD for the rating (0<p<1)
+        rho : asset correlation (0<rho<1)
+        y   : common factor values (array)
+    Returns:
+        q(y) = Φ((Φ^{-1}(p) - √ρ y) / √(1-ρ))
+    """
+    z = norm.ppf(np.clip(p, 1e-12, 1 - 1e-12))
+    s = np.sqrt(np.clip(rho, 1e-12, 1 - 1e-12))
+    return norm.cdf((z - s * y) / np.sqrt(1.0 - s * s))
+
+
+def log_binom_pmf(k: int, n: int, q: np.ndarray) -> np.ndarray:
+    """
+    Stable log Binomial(n, q) PMF evaluated at k, vectorized in q.
+    Uses log-choose via gammaln.
+    """
+    from scipy.special import gammaln
+    if k < 0 or k > n:
+        return np.full_like(q, -np.inf, dtype=float)
+    q = np.clip(q, 1e-15, 1 - 1e-15)
+    logC = gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
+    return logC + k * np.log(q) + (n - k) * np.log1p(-q)
+
+
+def log_mixed_binom_prob(n: int, k: int, p: float, rho: float,
+                         y: np.ndarray, lw: np.ndarray) -> float:
+    """
+    Log of the mixture probability:
+        P[K=k | n, p, rho] = ∫ φ(y) BinPMF(k; n, q(y)) dy
+    Approximated by Gauss–Hermite with (y, lw).
+    """
+    if n == 0:
+        return 0.0  # empty cell contributes nothing
+    # PMF per node
+    q = vasicek_cond_pd(p, rho, y)
+    lp = log_binom_pmf(k, n, q)         # shape [nodes]
+    # integral ≈ sum_i exp(lw_i + lp_i)
+    m = np.max(lw + lp)
+    return float(m + np.log(np.sum(np.exp(lw + lp - m))))  # log-sum-exp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Likelihood and MLE wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def negloglik_rho(rho: float,
+                  df_exposures: pd.DataFrame,
+                  df_defaults: pd.DataFrame,
+                  p_by_rating: Sequence[float],
+                  nodes: int = 60) -> float:
+    """
+    Negative log-likelihood over all (rating g, period t) cells,
+    assuming a common ρ and given TTC PDs per rating.
+
+    Args:
+        rho          : asset correlation to evaluate
+        df_exposures : DataFrame [ratings x periods] with n_{g,t}
+        df_defaults  : DataFrame [ratings x periods] with k_{g,t}
+        p_by_rating  : list/array of PDs aligned with df_exposures.index
+        nodes        : Gauss–Hermite nodes
+
+    Returns:
+        Scalar negative log-likelihood.
+    """
+    if not (df_exposures.index.equals(df_defaults.index) and
+            df_exposures.columns.equals(df_defaults.columns)):
+        raise ValueError("exposures/defaults must have identical shape & labels.")
+    if len(p_by_rating) != len(df_exposures.index):
+        raise ValueError("p_by_rating length must match number of ratings (rows).")
+
+    rho = float(rho)
+    if not (1e-8 < rho < 0.999):
+        return np.inf  # outside admissible range
+
+    y, lw = gh_nodes(nodes)
+    n_mat = df_exposures.to_numpy(dtype=np.int64)
+    k_mat = df_defaults.to_numpy(dtype=np.int64)
+    p_vec = np.asarray(p_by_rating, dtype=float)
+
+    total = 0.0
+    G, T = n_mat.shape
+    for g in range(G):
+        p = float(np.clip(p_vec[g], 1e-12, 1 - 1e-12))
+        for t in range(T):
+            n = int(n_mat[g, t])
+            if n == 0:
+                continue
+            k = int(k_mat[g, t])
+            if k < 0 or k > n:
+                return np.inf
+            lp = log_mixed_binom_prob(n, k, p, rho, y, lw)
+            total += lp
+    return -total
+
+
+def fit_rho_mle(df_exposures: pd.DataFrame,
+                df_defaults: pd.DataFrame,
+                p_by_rating: Sequence[float],
+                bounds: Tuple[float, float] = (1e-4, 0.5),
+                nodes: int = 60) -> Dict[str, Any]:
+    """
+    Calibrate a single common ρ by MLE.
+
+    Args:
+        df_exposures : DataFrame [ratings x periods] n_{g,t}
+        df_defaults  : DataFrame [ratings x periods] k_{g,t}
+        p_by_rating  : TTC PDs per rating (best→worst), length = #rows
+        bounds       : search interval for ρ
+        nodes        : GH nodes (accuracy/speed trade-off)
+
+    Returns:
+        dict with keys:
+          'rho_hat', 'negloglik', 'success', 'message', 'nfev'
+    """
+    obj = lambda r: negloglik_rho(r, df_exposures, df_defaults, p_by_rating, nodes)
+    res = minimize_scalar(obj, bounds=bounds, method="bounded",
+                          options={"xatol": 1e-6, "maxiter": 500})
+    return {
+        "rho_hat": float(res.x),
+        "negloglik": float(res.fun),
+        "success": bool(res.success),
+        "message": str(res.message),
+        "nfev": int(res.nfev),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience: quick sanity check / example
+# ─────────────────────────────────────────────────────────────────────────────
+
+def mle_example():
+    """
+    Tiny synthetic demo (replace with your data):
+      - 18 ratings × 8 periods
+      - exposures from a small pattern
+      - defaults simulated from a Vasicek model with true rho
+      - TTC PDs (per rating) known and passed in
+    """
+    rng = np.random.default_rng(7)
+    G, T = 6, 5  # keep small for demo
+    p_by_rating = np.linspace(0.002, 0.02, G)                 # TTC PDs best→worst
+    n_per_rating = (1000 * np.ones(G)).astype(int)            # base size
+    # Build DataFrames
+    index = [f"R{g+1}" for g in range(G)]
+    cols  = [f"Y{t+1}" for t in range(T)]
+    df_exp = pd.DataFrame(np.repeat(n_per_rating[:, None], T, axis=1), index=index, columns=cols)
+
+    # Simulate defaults with Vasicek (true rho)
+    true_rho = 0.12
+    S = rng.standard_normal(T)                                 # one S per period
+    eps = rng.standard_normal((G, T, n_per_rating.max()))
+    df_def = pd.DataFrame(0, index=index, columns=cols, dtype=int)
+    for g in range(G):
+        c = norm.ppf(p_by_rating[g])
+        for t in range(T):
+            n = df_exp.iloc[g, t]
+            v = np.sqrt(true_rho) * S[t] + np.sqrt(1 - true_rho) * eps[g, t, :n]
+            k = int(np.sum(v <= c))
+            df_def.iloc[g, t] = k
+
+    # Fit rho
+    out = fit_rho_mle(df_exp, df_def, p_by_rating, bounds=(1e-4, 0.5), nodes=60)
+    return out, df_exp, df_def, p_by_rating
+
+# If you want to try quickly:
+# res, exp_, def_, pvec_ = mle_example()
+# print(res)
