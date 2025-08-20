@@ -1,0 +1,181 @@
+import numpy as np
+import pandas as pd
+from typing import Sequence, Tuple, Dict, Any, Union
+from numpy.polynomial.legendre import leggauss
+from scipy.stats import norm
+from scipy.optimize import minimize_scalar
+from scipy.special import gammaln
+
+# ─────────────────────────────────────────────────────────────
+# 0) Utilities: PD mapping, sanity, stable binomial log-PMF
+# ─────────────────────────────────────────────────────────────
+
+def _as_p_vector(p_by_rating: Union[Sequence[float], pd.Series],
+                 index: pd.Index) -> np.ndarray:
+    """
+    Map PDs to the order of rating rows. If values look like percents (>0.3),
+    scale to fractions. Clips to (1e-12, 1-1e-12).
+    """
+    if isinstance(p_by_rating, pd.Series):
+        p = p_by_rating.reindex(index).to_numpy(dtype=float)
+    else:
+        p = np.asarray(p_by_rating, dtype=float)
+        if len(p) != len(index):
+            raise ValueError("p_by_rating length must match number of rating rows.")
+    if np.nanmax(p) > 0.3:  # heuristic: PDs passed in %
+        p = p / 100.0
+    return np.clip(p, 1e-12, 1 - 1e-12)
+
+def _sanity(df_exp: pd.DataFrame, df_def: pd.DataFrame, p_vec: np.ndarray):
+    if not (df_exp.index.equals(df_def.index) and df_exp.columns.equals(df_def.columns)):
+        raise ValueError("exposures/defaults must share identical index & columns.")
+    if len(p_vec) != len(df_exp.index):
+        raise ValueError("p_by_rating length must equal number of ratings (rows).")
+    if (df_exp.to_numpy() < 0).any() or (df_def.to_numpy() < 0).any():
+        raise ValueError("Negative n or k found.")
+    if (df_def.to_numpy() > df_exp.to_numpy()).any():
+        raise ValueError("Found cells with k > n.")
+
+def log_binom_pmf_vec(k: np.ndarray, n: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """
+    Vectorised log Binomial PMF for arrays k,n,q of the same length.
+    """
+    q = np.clip(q, 1e-15, 1 - 1e-15)
+    return (gammaln(n + 1) - gammaln(k + 1) - gammaln(n - k + 1)
+            + k * np.log(q) + (n - k) * np.log1p(-q))
+
+# ─────────────────────────────────────────────────────────────
+# 1) Legendre nodes on (0,1)  (u = Φ(y), du = φ(y) dy)
+# ─────────────────────────────────────────────────────────────
+
+def leg_nodes(n: int = 60) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    n-point Gauss–Legendre nodes/weights for ∫_0^1 f(u) du.
+    Returns:
+        u  : nodes in (0,1)
+        lw : log-weights = log(w/2)  (we use log-sum-exp later)
+    """
+    x, w = leggauss(n)                # nodes/weights on [-1,1]
+    u = 0.5 * (x + 1.0)               # map to (0,1)
+    lw = np.log(w) - np.log(2.0)      # log(w/2)
+    return u, lw
+
+# ─────────────────────────────────────────────────────────────
+# 2) Conditional PD & per-period integral with product over ratings
+#     (exact: product INSIDE the integral, sum of logs across ratings)
+# ─────────────────────────────────────────────────────────────
+
+def _log_period_integral_legendre(n_vec: np.ndarray, k_vec: np.ndarray,
+                                  z_vec: np.ndarray, rho: float,
+                                  u: np.ndarray, lw: np.ndarray,
+                                  eps: float = 1e-12) -> float:
+    """
+    For one period t, compute:
+        log ∫_0^1  Π_g BinPMF( k_g; n_g, q_g(Φ^{-1}(u)) )  du
+    with q_g(y) = Φ((z_g - √ρ y)/√(1-ρ)),  z_g = Φ^{-1}(p_g).
+    Uses log-sum-exp across Legendre nodes (weights lw = log(w/2)).
+
+    Inputs:
+        n_vec, k_vec : 1-D arrays over ratings (only entries with n>0)
+        z_vec        : Φ^{-1}(p_g) over ratings
+        rho          : asset correlation (0<rho<1)
+        u, lw        : Legendre nodes and log-weights on (0,1)
+    Returns:
+        float = log integral for this period
+    """
+    if n_vec.size == 0:
+        return 0.0
+
+    rho = float(rho)
+    if not (1e-8 < rho < 0.999):
+        return -np.inf
+
+    s = np.sqrt(rho)
+    d = np.sqrt(1.0 - rho)
+
+    # loop over nodes (clean & robust; n=40–80 is fine)
+    lsum = np.empty_like(u)
+    for i in range(u.size):
+        ui = float(np.clip(u[i], eps, 1 - eps))
+        y  = norm.ppf(ui)
+        qg = norm.cdf((z_vec - s * y) / d)                # vector over ratings
+        lsum[i] = np.sum(log_binom_pmf_vec(k_vec, n_vec, qg))
+
+    # log ∫_0^1 f(u) du ≈ log-sum-exp(lw + lsum)
+    m = np.max(lw + lsum)
+    return float(m + np.log(np.sum(np.exp(lw + lsum - m))))
+
+# ─────────────────────────────────────────────────────────────
+# 3) Negative log-likelihood over all periods (exact variant)
+# ─────────────────────────────────────────────────────────────
+
+def negloglik_rho_leg_exact(
+    rho: float,
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    p_by_rating: Union[Sequence[float], pd.Series],
+    nodes: int = 60
+) -> float:
+    """
+    Exact negative log-likelihood with the per-period product of rating
+    likelihoods INSIDE the integral, evaluated on (0,1) via Gauss–Legendre.
+
+      log L(ρ) = Σ_t log ∫_0^1 Π_g BinPMF(k_{g,t}; n_{g,t}, q_g(Φ^{-1}(u))) du
+
+    Returns: -log L(ρ)
+    """
+    rho = float(rho)
+    if not (1e-8 < rho < 0.999):
+        return np.inf
+
+    p_vec = _as_p_vector(p_by_rating, df_exposures.index)        # rows
+    _sanity(df_exposures, df_defaults, p_vec)
+
+    z_vec_all = norm.ppf(p_vec)                                  # Φ^{-1}(p_g)
+    n_mat = df_exposures.to_numpy(dtype=np.int64)                # [G,T]
+    k_mat = df_defaults.to_numpy(dtype=np.int64)
+    G, T = n_mat.shape
+
+    u, lw = leg_nodes(nodes)
+
+    total_loglik = 0.0
+    for t in range(T):
+        n_t = n_mat[:, t]
+        k_t = k_mat[:, t]
+        mask = n_t > 0
+        if not np.any(mask):
+            continue
+        n = n_t[mask].astype(np.int64)
+        k = k_t[mask].astype(np.int64)
+        z = z_vec_all[mask]
+
+        total_loglik += _log_period_integral_legendre(n, k, z, rho, u, lw)
+
+    return -float(total_loglik)
+
+# ─────────────────────────────────────────────────────────────
+# 4) MLE wrapper (bounded scalar minimization)
+# ─────────────────────────────────────────────────────────────
+
+def fit_rho_mle_leg_exact(
+    df_exposures: pd.DataFrame,
+    df_defaults: pd.DataFrame,
+    p_by_rating: Union[Sequence[float], pd.Series],
+    bounds: Tuple[float, float] = (1e-4, 0.5),
+    nodes: int = 60
+) -> Dict[str, Any]:
+    """
+    Calibrate a common ρ by minimizing negloglik_rho_leg_exact over bounds.
+    """
+    obj = lambda r: negloglik_rho_leg_exact(r, df_exposures, df_defaults, p_by_rating, nodes)
+    res = minimize_scalar(obj, bounds=bounds, method="bounded",
+                          options={"xatol": 1e-6, "maxiter": 800})
+    return {
+        "rho_hat": float(res.x),
+        "negloglik": float(res.fun),
+        "success": bool(res.success),
+        "message": str(res.message),
+        "nfev": int(res.nfev),
+        "nodes": nodes,
+        "bounds": bounds,
+    }
