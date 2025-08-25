@@ -1,0 +1,136 @@
+import numpy as np
+import pandas as pd
+from typing import Tuple
+from numpy.polynomial.legendre import leggauss
+from scipy.stats import norm, binom
+
+# ─────────────────────────────────────────────────────────────
+# 1) Gauss–Legendre nodes on (0,1)
+# ─────────────────────────────────────────────────────────────
+
+def leg_nodes(n: int = 60) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    n-point Gauss–Legendre nodes/weights for ∫_0^1 f(u) du.
+    Returns:
+        u  : nodes in (0,1)   (shape [n])
+        w  : weights on (0,1) (shape [n]), sum(w) = 1
+    """
+    x, w = leggauss(n)          # nodes/weights for ∫_{-1}^1
+    u = 0.5 * (x + 1.0)         # map to (0,1)
+    w01 = 0.5 * w               # weights for (0,1)
+    return u.astype(float), w01.astype(float)
+
+# ─────────────────────────────────────────────────────────────
+# 2) Single-cell integral G_{n,k}(p; rho) via Legendre quadrature
+# ─────────────────────────────────────────────────────────────
+
+def cell_tail_integral_legendre(n: int, k: int, p: float, rho: float,
+                                u: np.ndarray, w: np.ndarray,
+                                eps: float = 1e-12) -> float:
+    """
+    Compute G_{n,k}(p; rho) = ∫_0^1 BinCDF(k; n, q(u)) du
+    with q(u) = Φ((Φ^{-1}(p) - √ρ Φ^{-1}(u))/√(1-ρ)).
+    Args:
+        n,k : binomial parameters for the cell (0 ≤ k ≤ n)
+        p   : TTC PD candidate in (0,1)
+        rho : asset correlation in (0,1)
+        u,w : Legendre nodes/weights on (0,1) (from leg_nodes)
+        eps : numeric clipping for endpoints
+    Returns:
+        float in (0,1): integral value.
+    """
+    if n == 0:
+        return 1.0  # empty cell ⇒ P(X≤k)=1 regardless of p
+    if k < 0 or k > n:
+        return 0.0
+
+    p  = float(np.clip(p,  eps, 1 - eps))
+    rho = float(np.clip(rho, eps, 1 - eps))
+    s  = np.sqrt(rho)
+    d  = np.sqrt(1.0 - rho)
+    z  = norm.ppf(p)
+
+    # Vectorised over nodes u: y = Φ^{-1}(u), q = Φ((z - √ρ y)/√(1-ρ))
+    u_clipped = np.clip(u, eps, 1 - eps)
+    y = norm.ppf(u_clipped)
+    q = norm.cdf((z - s * y) / d)
+    q = np.clip(q, eps, 1 - eps)
+
+    # Binomial CDF at each node, then quadrature weight average
+    vals = binom.cdf(k, n, q)          # shape [len(u)], each ∈ (0,1)
+    return float(np.sum(w * vals))     # ∑ w_i f(u_i)
+
+# ─────────────────────────────────────────────────────────────
+# 3) Bisection: largest p with G_{n,k}(p) ≥ 1 - gamma
+# ─────────────────────────────────────────────────────────────
+
+def solve_p_upper_cell(n: int, k: int, rho: float, gamma: float,
+                       u: np.ndarray, w: np.ndarray,
+                       tol: float = 1e-6, maxiter: int = 200) -> float:
+    """
+    Find p_γ for a single cell (n,k): the largest p such that
+        G_{n,k}(p; rho) ≥ 1 - gamma,
+    where G is computed by cell_tail_integral_legendre.
+    Monotonicity: G decreases in p ⇒ bisection is valid.
+    """
+    target = 1.0 - float(gamma)
+    lo, hi = 1e-8, 0.5   # sensible bracket for PD (adjust if needed)
+
+    # Early-outs for edge k:
+    if n == 0:
+        return 0.0
+    if k >= n:
+        return hi  # CDF(k=n) = 1 ⇒ inequality holds for all p in [0,hi]
+
+    for _ in range(maxiter):
+        mid = 0.5 * (lo + hi)
+        gval = cell_tail_integral_legendre(n, k, mid, rho, u, w)
+        if gval >= target:
+            lo = mid    # still conservative → can raise p
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return lo
+
+# ─────────────────────────────────────────────────────────────
+# 4) Wrapper: compute p_γ for every cell in the panel
+# ─────────────────────────────────────────────────────────────
+
+def section4_upper_bounds_table(df_exposures: pd.DataFrame,
+                                df_defaults: pd.DataFrame,
+                                rho: float, gamma: float,
+                                nodes: int = 60,
+                                tol: float = 1e-6) -> pd.DataFrame:
+    """
+    Compute single-period PD upper bounds p_γ per cell (rating × period),
+    using Legendre quadrature and bisection as in (4.3a).
+    Args:
+        df_exposures : DataFrame [ratings x periods] with n_{g,t} (ints)
+        df_defaults  : DataFrame [ratings x periods] with k_{g,t} (ints)
+        rho          : asset correlation (scalar)
+        gamma        : confidence level γ (e.g., 0.95)
+        nodes        : number of Legendre nodes (40–80 is typical)
+        tol          : bisection tolerance
+    Returns:
+        DataFrame of same shape with p̂_γ per cell in (0, 0.5].
+    """
+    if not (df_exposures.index.equals(df_defaults.index)
+            and df_exposures.columns.equals(df_defaults.columns)):
+        raise ValueError("exposures/defaults must have identical index/columns.")
+    if (df_exposures.to_numpy() < 0).any() or (df_defaults.to_numpy() < 0).any():
+        raise ValueError("Negative n or k found.")
+    if (df_defaults.to_numpy() > df_exposures.to_numpy()).any():
+        raise ValueError("Found cells with k>n.")
+
+    u, w = leg_nodes(nodes)
+    out = pd.DataFrame(index=df_exposures.index, columns=df_exposures.columns, dtype=float)
+
+    for g in df_exposures.index:
+        for t in df_exposures.columns:
+            n = int(df_exposures.loc[g, t])
+            k = int(df_defaults.loc[g, t])
+            p_hat = solve_p_upper_cell(n, k, rho, gamma, u, w, tol=tol)
+            out.loc[g, t] = p_hat
+
+    return out
